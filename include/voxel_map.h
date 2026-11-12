@@ -44,6 +44,7 @@ typedef struct VoxelMapConfig
   double dept_err_;
   double sigma_num_;
   bool is_pub_plane_map_;
+  bool metric_neighbor_search_en_ = true;
 
   // config of local map sliding
   double sliding_thresh;
@@ -64,6 +65,7 @@ typedef struct PointToPlane
   double eigen_value_;
   bool is_valid_;
   float dis_to_plane_;
+  double visual_radius_ = 0.0;
 } PointToPlane;
 
 typedef struct VoxelPlane
@@ -212,6 +214,8 @@ public:
 
   int feats_down_size_;
   int effct_feat_num_;
+  // Weighted translation block of the most recent LiDAR measurement Hessian.
+  M3D last_lidar_translation_information_ = M3D::Zero();
   std::vector<M3D> cross_mat_list_;
   std::vector<M3D> body_cov_list_;
   std::vector<pointWithVar> pv_list_;

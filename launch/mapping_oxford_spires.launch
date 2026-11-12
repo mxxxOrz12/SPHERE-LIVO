@@ -1,0 +1,29 @@
+<launch>
+  <arg name="config" default="$(find fast_livo)/config/oxford_spires_observatory_01.yaml" />
+  <arg name="seq_name" default="oxford_observatory_01" />
+  <arg name="spherical_patch" default="false" />
+  <arg name="shared_spherical_map" default="true" />
+  <arg name="information_selection" default="true" />
+  <arg name="joint_fixed_budget" default="true" />
+  <arg name="spherical_affine" default="true" />
+  <arg name="spherical_min_zncc" default="0.8" />
+  <arg name="spherical_map_max_points" default="60000" />
+  <arg name="max_active_cameras" default="2" />
+  <arg name="total_patch_budget" default="120" />
+  <arg name="map_sliding_en" default="false" />
+  <arg name="half_map_size" default="100" />
+  <rosparam command="load" file="$(arg config)" />
+  <param name="/evo/seq_name" value="$(arg seq_name)" />
+  <param name="/innovations/spherical_patch" value="$(arg spherical_patch)" />
+  <param name="/innovations/shared_spherical_map" value="$(arg shared_spherical_map)" />
+  <param name="/innovations/information_selection" value="$(arg information_selection)" />
+  <param name="/innovations/joint_fixed_budget" value="$(arg joint_fixed_budget)" />
+  <param name="/innovations/spherical_affine" value="$(arg spherical_affine)" />
+  <param name="/innovations/spherical_min_zncc" value="$(arg spherical_min_zncc)" />
+  <param name="/innovations/spherical_map_max_points" value="$(arg spherical_map_max_points)" />
+  <param name="/innovations/max_active_cameras" value="$(arg max_active_cameras)" />
+  <param name="/innovations/total_patch_budget" value="$(arg total_patch_budget)" />
+  <param name="/local_map/map_sliding_en" value="$(arg map_sliding_en)" />
+  <param name="/local_map/half_map_size" value="$(arg half_map_size)" />
+  <node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen" />
+</launch>

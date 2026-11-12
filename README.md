@@ -1,110 +1,127 @@
-# FAST-LIVO2
+# SPHERE-LIVO
 
-## FAST-LIVO2: Fast, Direct LiDAR-Inertial-Visual Odometry
+Multi-fisheye LiDAR–inertial–visual odometry built on
+[FAST-LIVO2](https://github.com/hku-mars/FAST-LIVO2).
 
-### 📢 News
+SPHERE-LIVO combines synchronized fisheye cameras with LiDAR and IMU measurements.
+It adds shared spherical patches, information-based observation selection and a
+joint visual update with a configurable patch budget. The ROS package remains
+`fast_livo` for compatibility with the upstream implementation.
 
-- 🔓 **2025-01-23**: Code released!  
-- 🎉 **2024-10-01**: Accepted by **T-RO '24**!  
-- 🚀 **2024-07-02**: Conditionally accepted.
+## Features
 
-### 📬 Contact
+- Calibrated equidistant fisheye cameras with raw or JPEG-compressed ROS images.
+- World-anchored spherical patches shared across cameras using local LiDAR planes.
+- Camera and patch selection informed by LiDAR geometric constraints.
+- Configurable camera, patch, candidate-probe and visual-map budgets.
+- Optional brightness models, geometry support and guarded visual updates.
+- TUM trajectories, visual timing logs and reconstructed PCD point clouds.
 
-For further inquiries or assistance, please contact [zhengcr@connect.hku.hk](mailto:zhengcr@connect.hku.hk).
+This is research software. Current experiments do **not** establish a consistent
+accuracy advantage over Omni-LIVO. Results depend on the sequence, calibration,
+configuration and replay rate. A bounded patch count does not guarantee a bounded
+total processing time. This repository provides odometry and mapping; it does not
+implement loop closure or 3D Gaussian reconstruction.
 
-## 1. Introduction
+## Build
 
-FAST-LIVO2 is an efficient and accurate LiDAR-inertial-visual fusion localization and mapping system, demonstrating significant potential for real-time 3D reconstruction and onboard robotic localization in severely degraded environments.
-
-**Developer**: [Chunran Zheng 郑纯然](https://github.com/xuankuzcr)
-
-<div align="center">
-    <img src="pics/Framework.png" width = 100% >
-</div>
-
-### 1.1 Related video
-
-Our accompanying video is now available on [**Bilibili**](https://www.bilibili.com/video/BV1Ezxge7EEi) and [**YouTube**](https://youtu.be/6dF2DzgbtlY).
-
-### 1.2 Related paper
-
-[FAST-LIVO2: Fast, Direct LiDAR-Inertial-Visual Odometry](https://arxiv.org/pdf/2408.14035)  
-
-[FAST-LIVO2 on Resource-Constrained Platforms](https://arxiv.org/pdf/2501.13876)  
-
-[FAST-LIVO: Fast and Tightly-coupled Sparse-Direct LiDAR-Inertial-Visual Odometry](https://arxiv.org/pdf/2203.00893)
-
-[FAST-Calib: LiDAR-Camera Extrinsic Calibration in One Second](https://www.arxiv.org/pdf/2507.17210)
-
-### 1.3 Our hard-synchronized equipment
-
-We open-source our handheld device, including CAD files, synchronization scheme, STM32 source code, wiring instructions, and sensor ROS driver. Access these resources at this repository: [**LIV_handhold**](https://github.com/xuankuzcr/LIV_handhold).
-
-### 1.4 Our associate dataset: FAST-LIVO2-Dataset
-Our associate dataset [**FAST-LIVO2-Dataset**](https://connecthkuhk-my.sharepoint.com/:f:/g/personal/zhengcr_connect_hku_hk/ErdFNQtjMxZOorYKDTtK4ugBkogXfq1OfDm90GECouuIQA?e=KngY9Z) used for evaluation is also available online.
-
-### 1.5 Our LiDAR-camera calibration method
-The [**FAST-Calib**](https://github.com/hku-mars/FAST-Calib) toolkit is recommended. Its output extrinsic parameters can be directly filled into the YAML file. 
-
-## 2. Prerequisited
-
-### 2.1 Ubuntu and ROS
-
-Ubuntu 18.04~20.04.  [ROS Installation](http://wiki.ros.org/ROS/Installation).
-
-### 2.2 PCL && Eigen && OpenCV
-
-PCL>=1.8, Follow [PCL Installation](https://pointclouds.org/). 
-
-Eigen>=3.3.4, Follow [Eigen Installation](https://eigen.tuxfamily.org/index.php?title=Main_Page).
-
-OpenCV>=4.2, Follow [Opencv Installation](http://opencv.org/).
-
-### 2.3 Sophus
-
-Sophus Installation for the non-templated/double-only version.
+Validated locally on Ubuntu 20.04 / ROS Noetic, including WSL. Install ROS Noetic,
+PCL, Eigen, OpenCV and the non-templated Sophus version described in
+[the upstream instructions](README.upstream.md). For evaluation, install Python
+NumPy, SciPy and PyYAML.
 
 ```bash
-git clone https://github.com/strasdat/Sophus.git
-cd Sophus
-git checkout a621ff
-mkdir build && cd build && cmake ..
-make
-sudo make install
+mkdir -p ~/sphere_ws/src
+cd ~/sphere_ws/src
+git clone https://github.com/mxxxOrz12/SPHERE-LIVO.git
+git clone https://github.com/xuankuzcr/rpg_vikit.git
+git -C rpg_vikit checkout 6c886c8e5d83997806e00294826d528cea3581dd
+source /opt/ros/noetic/setup.bash
+cd ~/sphere_ws
+catkin_make -j1 -l2 -DCMAKE_BUILD_TYPE=Release \
+  -DPYTHON_EXECUTABLE=/usr/bin/python3 \
+  -DSophus_LIBRARIES=/usr/local/lib/libSophus.so
+source devel/setup.bash
 ```
 
-### 2.4 Vikit
+The Sophus library path above assumes the upstream `/usr/local` installation.
+Adjust it to your installation. Serial compilation is recommended on machines
+with limited memory. Dataset files and compiled dependencies are not included.
 
-Vikit contains camera models, some math and interpolation functions that we need. Vikit is a catkin project, therefore, download it into your catkin workspace source folder.
+## Oxford Spires example
+
+`config/sphere_oxford.yaml` is the complete preset used in the successful
+migration replay check. It enables the current SPHERE-LIVO profile and point
+cloud saving. It differs from the older experimental presets retained in
+`config/oxford_spires_observatory_01.yaml`.
+
+First terminal:
 
 ```bash
-# Different from the one used in fast-livo1
-cd catkin_ws/src
-git clone https://github.com/xuankuzcr/rpg_vikit.git 
+source ~/sphere_ws/devel/setup.bash
+roslaunch fast_livo mapping_sphere_oxford.launch seq_name:=observatory_test
 ```
 
-## 3. Build
+Second terminal:
 
-Clone the repository and catkin_make:
-
-```
-cd ~/catkin_ws/src
-git clone https://github.com/hku-mars/FAST-LIVO2
-cd ../
-catkin_make
-source ~/catkin_ws/devel/setup.bash
+```bash
+source /opt/ros/noetic/setup.bash
+rosbag play --clock -r 0.4 --duration 30 /path/to/observatory-quarter-01.bag
 ```
 
-## 4. Run our examples
+Use a fresh `seq_name` for every run. Allow the mapper to finish processing after
+bag playback, then stop it with Ctrl+C so point clouds are flushed. On shutdown,
+the default outputs are inside this source package:
 
-Download FAST-LIVO2-Dataset from [Global-LVBA](https://github.com/xuankuzcr/Global-LVBA) Section IV.
+- `Log/result/<seq_name>.txt`: IMU trajectory in TUM format.
+- `Log/result/<seq_name>_timing.csv`: visual update timing and counts.
+- `Log/pcd/`: reconstructed point clouds.
 
+The preset consumes the original compressed bag images. Official separately
+distributed white-balanced images require timestamp-matched input preparation;
+they are not substituted automatically.
+
+For another rig, see [camera and method notes](MULTI_FISHEYE.md) and
+`config/multi_fisheye.template.yaml`. The template contains intentionally invalid
+calibration values and must be filled before use.
+
+## Evaluate a trajectory
+
+Oxford reference poses use a different body frame from the estimated IMU poses.
+The supplied evaluator applies the published frame conversion and rigid SE(3)
+alignment, without fitting scale:
+
+```bash
+python3 scripts/evaluate_oxford_tum.py \
+  Log/result/observatory_test.txt /path/to/gt-tum.txt \
+  --config config/sphere_oxford.yaml
 ```
-roslaunch fast_livo mapping_avia.launch
-rosbag play YOUR_DOWNLOADED.bag
-```
 
+The current algorithm source was compiled and replayed on 30-second prefixes of
+Hilti exp04 and Oxford Observatory-01 before publication. These are functional
+checks of trajectory and point-cloud output, not full-sequence accuracy claims.
+Full datasets, experiment outputs and the Omni-LIVO comparison implementation are
+managed separately.
 
-## 5. License
+## Limitations
 
-The source code of this package is released under the [**GPLv2**](http://www.gnu.org/licenses/) license. For commercial use, please contact me at <zhengcr@connect.hku.hk> and Prof. Fu Zhang at <fuzhang@hku.hk> to discuss an alternative license.
+Complete camera groups are required; camera dropout can stall the pipeline.
+The current fisheye model expects a calibrated field of view below 180 degrees.
+Spherical patches assume locally planar surfaces. Camera clocks, image sizes and
+extrinsics must match the configuration. Fisheye COLMAP export is not supported
+by the inherited pinhole exporter; keep `colmap_output_en: false`.
+
+## Acknowledgements and license
+
+This work modifies FAST-LIVO2 and uses rpg_vikit camera models. Original history,
+copyright notices and the upstream [GPL-2.0 license](LICENSE) are retained.
+See [README.upstream.md](README.upstream.md) for original authors, papers,
+citations and additional upstream examples.
+
+## 中文说明
+
+SPHERE-LIVO 是基于 FAST-LIVO2 的多鱼眼激光–惯性–视觉里程计研究实现，
+包含共享球面补丁、信息驱动的观测选择以及联合视觉更新。
+ROS 包名仍为 `fast_livo`。建议使用上面的 `mapping_sphere_oxford.launch`
+运行当前配置，轨迹和点云保存在源码目录的 `Log/` 下。
+现有实验尚未证明相对 Omni-LIVO 存在稳定的精度优势；请根据序列实测评估。

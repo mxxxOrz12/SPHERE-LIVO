@@ -1,0 +1,155 @@
+# Oxford Spires 2024-03-13-observatory-quarter-01, ROS 1 raw bag.
+# Camera parameters and LiDAR/camera/IMU transforms come from the dataset's
+# configs/sensor.yaml (OPENCV_FISHEYE). Rcl/Pcl map LiDAR coordinates to camera.
+# extrinsic_R/T below map LiDAR coordinates to IMU, derived from the two
+# cam_front transforms in that same calibration file.
+common:
+  lid_topic: /hesai/pandar
+  imu_topic: /alphasense_driver_ros/imu
+  img_en: 1
+  lidar_en: 1
+
+multi_fisheye:
+  enabled: true
+  camera_count: 3
+  compressed_images: true
+  sync_tolerance: 0.005
+  frame_stride: 2  # 20 Hz camera rig -> at most 10 Hz visual updates
+  cam0:
+    img_topic: /alphasense_driver_ros/cam0/debayered/image/compressed
+    Rcl: [0.00976944336946739, 0.9999460020163567, 0.003542742970500279,
+          0.007671197638838501, 0.00346786135188204, -0.999964562704314,
+          -0.9999228523756404, 0.0097962742483243, -0.007636904334543448]
+    Pcl: [0.00035060884033447846, -0.079574053851818, -0.053826061545697405]
+    cam_model: EquidistantCamera
+    cam_width: 1440
+    cam_height: 1080
+    scale: 0.5
+    cam_fx: 698.1692094914263
+    cam_fy: 698.5147584873237
+    cam_cx: 712.7646767255006
+    cam_cy: 560.5751284820508
+    k1: -0.04114225009462773
+    k2: -0.002421765984053725
+    k3: 0.003400355152679783
+    k4: -0.0018518822347983275
+  cam1:
+    img_topic: /alphasense_driver_ros/cam1/debayered/image/compressed
+    Rcl: [-0.9999243215275557, 0.01198521423408928, -0.0027759426184009693,
+          0.0028024268194068447, 0.002193510766066442, -0.9999936674371699,
+          -0.011979049276947663, -0.9999257688200072, -0.002226932450328567]
+    Pcl: [0.00003388762063794015, -0.07994358595369325, -0.05600121569499821]
+    cam_model: EquidistantCamera
+    cam_width: 1440
+    cam_height: 1080
+    scale: 0.5
+    cam_fx: 697.4908124760002
+    cam_fy: 696.9171455329763
+    cam_cx: 719.1718975625936
+    cam_cy: 543.7401536075661
+    k1: -0.04417827343575797
+    k2: 0.006234275291082348
+    k3: -0.0028153029005502637
+    k4: -0.0005652124301059104
+  cam2:
+    img_topic: /alphasense_driver_ros/cam2/debayered/image/compressed
+    Rcl: [0.9999921349972388, -0.003921084319135888, 0.0005958535276505651,
+          0.0006012627291975057, 0.001378482584051155, -0.9999988691338085,
+          0.003920258511203686, 0.9999913624044597, 0.0013808293441409658]
+    Pcl: [-0.0006070783260079121, -0.07992015242752262, -0.054798558347406996]
+    cam_model: EquidistantCamera
+    cam_width: 1440
+    cam_height: 1080
+    scale: 0.5
+    cam_fx: 698.4588137038655
+    cam_fy: 699.3937128891818
+    cam_cx: 708.6474762128631
+    cam_cy: 533.7390355049014
+    k1: -0.042476719963857094
+    k2: -0.00421520261588724
+    k3: 0.006942403828737165
+    k4: -0.0034076218162515594
+
+innovations:
+  spherical_patch: false  # baseline; set true via launch arg for the new method
+  shared_spherical_map: true
+  information_selection: true
+  joint_fixed_budget: true
+  spherical_affine: true  # ablation: false keeps absolute patch intensity
+  spherical_min_zncc: 0.8  # Oxford full-bag validated; reject stale/mismatched patches
+  max_active_cameras: 2
+  total_patch_budget: 120
+  map_insert_budget_per_camera: 30
+  spherical_probe_budget: 2048
+  joint_max_iterations: 3
+  spherical_map_max_points: 60000
+
+extrin_calib:
+  extrinsic_T: [-0.000651708683372088, -0.015510342560109035, 0.08463265780318904]
+  extrinsic_R: [-0.016638045748656113, -0.9998601056363506, 0.0017159809243348018,
+                 0.999855257258116, -0.016631813594098235, 0.0035843144224125944,
+                 -0.003555273122162113, 0.0017753685358884396, 0.9999921040186213]
+
+time_offset:
+  img_time_offset: 0.0
+  imu_time_offset: 0.0
+  lidar_time_offset: 0.0
+  exposure_time_init: 0.0
+
+preprocess:
+  lidar_type: 5  # XT32 parser also matches this bag's QT64 x/y/z/intensity/timestamp/ring layout
+  scan_line: 64
+  point_filter_num: 1
+  feature_extract_enabled: false  # XT32 feature path assumes a different timestamp unit
+  hilti_en: false
+  blind: 1.0
+  filter_size_surf: 0.2
+
+vio:
+  max_iterations: 5
+  outlier_threshold: 78
+  img_point_cov: 100
+  patch_size: 8
+  patch_pyrimid_level: 4
+  normal_en: true
+  raycast_en: false
+  inverse_composition_en: false
+  exposure_estimate_en: false
+
+imu:
+  imu_en: true
+  imu_int_frame: 30
+  acc_cov: 0.1
+  gyr_cov: 0.1
+
+lio:
+  max_iterations: 5
+  dept_err: 0.02
+  beam_err: 0.05
+  min_eigen_value: 0.0001
+  voxel_size: 0.4
+  max_layer: 2
+  max_points_num: 100
+  layer_init_num: [5, 5, 5, 5, 5]
+
+local_map:
+  map_sliding_en: false
+  half_map_size: 100
+  sliding_thresh: 8
+
+publish:
+  dense_map_en: false
+  pub_effect_point_en: false
+  pub_plane_en: false
+  pub_scan_num: 1
+
+evo:
+  seq_name: oxford_observatory_01
+  pose_output_en: true
+
+pcd_save:
+  pcd_save_en: false
+  colmap_output_en: false
+
+image_save:
+  img_save_en: false

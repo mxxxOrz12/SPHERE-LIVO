@@ -65,6 +65,7 @@ struct MeasureGroup
   double lio_time;
   deque<sensor_msgs::Imu::ConstPtr> imu;
   cv::Mat img;
+  std::vector<cv::Mat> camera_images;
   MeasureGroup()
   {
     vio_time = 0.0;
@@ -109,6 +110,8 @@ typedef struct pointWithVar
   Eigen::Matrix3d var;
   Eigen::Matrix3d point_crossmat;
   Eigen::Vector3d normal;
+  Eigen::Vector3d plane_center;
+  int visual_plane_index = -1; // Index into this frame's copied LIO associations, never a map pointer.
   pointWithVar()
   {
     var_nostate = Eigen::Matrix3d::Zero();
@@ -119,6 +122,7 @@ typedef struct pointWithVar
     point_i = Eigen::Vector3d::Zero();
     point_w = Eigen::Vector3d::Zero();
     normal = Eigen::Vector3d::Zero();
+    plane_center = Eigen::Vector3d::Zero();
   };
 } pointWithVar;
 

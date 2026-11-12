@@ -1,0 +1,7 @@
+<launch>
+  <arg name="config" default="$(find fast_livo)/config/sphere_oxford.yaml" />
+  <arg name="seq_name" default="sphere_oxford" />
+  <rosparam command="load" file="$(arg config)" />
+  <param name="/evo/seq_name" value="$(arg seq_name)" />
+  <node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen" />
+</launch>

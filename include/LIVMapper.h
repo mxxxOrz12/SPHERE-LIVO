@@ -19,6 +19,8 @@ which is included as part of this source code package.
 #include <cv_bridge/cv_bridge.h>
 #include <image_transport/image_transport.h>
 #include <nav_msgs/Path.h>
+#include <sensor_msgs/CompressedImage.h>
+#include <sstream>
 #include <vikit/camera_loader.h>
 
 class LIVMapper
@@ -34,6 +36,7 @@ public:
   void handleFirstFrame();
   void stateEstimationAndMapping();
   void handleVIO();
+  void runSphericalVIO(const std::vector<cv::Mat> &images);
   void handleLIO();
   void savePCD();
   void processImu();
@@ -48,7 +51,9 @@ public:
   void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg);
   void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg_in);
   void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in);
-  void img_cbk(const sensor_msgs::ImageConstPtr &msg_in);
+  void img_cbk(const sensor_msgs::ImageConstPtr &msg_in, size_t camera_id = 0);
+  void compressed_img_cbk(const sensor_msgs::CompressedImageConstPtr &msg_in, size_t camera_id);
+  void enqueueMultiFisheyeImage(const cv::Mat &image, double timestamp, size_t camera_id);
   void publish_img_rgb(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager);
   void publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, VIOManagerPtr vio_manager);
   void publish_visual_sub_map(const ros::Publisher &pubSubVisualMap);
@@ -70,6 +75,77 @@ public:
   
   string root_dir;
   string lid_topic, imu_topic, seq_name, img_topic;
+  bool multi_fisheye_en = false;
+  int camera_count = 1;
+  double camera_sync_tolerance = 0.005;
+  bool compressed_images = false;
+  int camera_frame_stride = 1;
+  bool spherical_patch_en = false;
+  bool shared_spherical_map_en = true;
+  bool information_selection_en = true;
+  bool joint_fixed_budget_en = true;
+  bool spherical_affine_en = true;
+  bool spherical_spatial_diversity_en = false;
+  bool spherical_marginalize_affine_en = false;
+  bool spherical_prefilter_zncc_en = false;
+  int spherical_pyramid_levels = 1;
+  bool spherical_camera_affine_en = false;
+  bool spherical_effective_information_en = false;
+  bool spherical_gain_only_en = false;
+  bool spherical_plane_anchor_en = false;
+  bool spherical_plane_refinement_en = false;
+  bool adaptive_camera_budget_en = false;
+  bool spherical_reference_refresh_en = false;
+  bool spherical_posterior_information_en = false;
+  bool spherical_transactional_update_en = false;
+  bool spherical_temporal_retrieval_en = false;
+  bool spherical_descent_guard_en = false;
+  bool spherical_incremental_information_en = false;
+  bool spherical_shared_brightness_en = false;
+  bool spherical_local_brightness_en = false;
+  bool spherical_bounded_brightness_en = false;
+  std::string last_spherical_brightness_gains;
+  std::string last_spherical_brightness_biases;
+  bool spherical_geometry_support_en = false;
+  double spherical_min_zncc = -1.0;
+  int max_active_cameras = 2;
+  int total_patch_budget = 120;
+  int map_insert_budget_per_camera = 30;
+  int spherical_probe_budget = 2048;
+  int joint_max_iterations = 3;
+  int spherical_map_max_points = 15000;
+  int last_selected_spherical_patches = 0;
+  int last_accepted_spherical_patches = 0;
+  int last_refreshed_spherical_patches = 0;
+  int last_temporal_selected_spherical_patches = 0;
+  int last_active_spherical_cameras = 0;
+  std::string last_active_camera_ids;
+  std::string last_camera_scores;
+  std::string last_camera_quotas;
+  double last_lidar_weak_ratio = -1.0;
+  int last_visual_guard_accepted_steps = 0;
+  int last_visual_guard_rejected_steps = 0;
+  int last_visual_guard_backtracks = 0;
+  double last_visual_guard_initial_cost = -1.0;
+  double last_visual_guard_final_cost = -1.0;
+  std::string last_visual_guard_status = "disabled";
+  int last_incremental_pool_size = 0;
+  int last_unique_world_patches = 0;
+  int last_geometry_fine_rejections = 0;
+  int last_geometry_coarse_rejections = 0;
+  int last_brightness_fit_rejections = 0, last_brightness_bound_fits = 0;
+  std::vector<std::string> camera_topics;
+  std::vector<std::vector<double>> camera_extrinsics_R;
+  std::vector<std::vector<double>> camera_extrinsics_T;
+  std::vector<double> last_camera_timestamps;
+  int camera_group_counter = 0;
+  struct TimedCameraFrame
+  {
+    double timestamp;
+    cv::Mat image;
+  };
+  std::vector<std::deque<TimedCameraFrame>> camera_frame_buffers;
+  std::deque<std::vector<cv::Mat>> img_group_buffer;
   V3D extT;
   M3D extR;
 
@@ -139,7 +215,7 @@ public:
   PointCloudXYZRGB::Ptr pcl_wait_save;
   PointCloudXYZI::Ptr pcl_wait_save_intensity;
 
-  ofstream fout_pre, fout_out, fout_visual_pos, fout_lidar_pos, fout_points;
+  ofstream fout_pre, fout_out, fout_visual_pos, fout_lidar_pos, fout_points, fout_vio_timing;
 
   pcl::VoxelGrid<PointType> downSizeFilterSurf;
 
@@ -158,12 +234,14 @@ public:
   ImuProcessPtr p_imu;
   VoxelMapManagerPtr voxelmap_manager;
   VIOManagerPtr vio_manager;
+  std::vector<VIOManagerPtr> camera_vios;
 
   ros::Publisher plane_pub;
   ros::Publisher voxel_pub;
   ros::Subscriber sub_pcl;
   ros::Subscriber sub_imu;
   ros::Subscriber sub_img;
+  std::vector<ros::Subscriber> camera_subscribers;
   ros::Publisher pubLaserCloudFullRes;
   ros::Publisher pubNormal;
   ros::Publisher pubSubVisualMap;

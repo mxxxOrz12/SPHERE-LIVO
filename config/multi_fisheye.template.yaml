@@ -1,0 +1,73 @@
+# Overlay this file on a LiDAR/IMU configuration. This template is
+# intentionally NOT runnable: fill every camera topic and calibration first.
+multi_fisheye:
+  enabled: true
+  camera_count: 3
+  sync_tolerance: 0.005  # maximum spread between camera timestamps, seconds
+  compressed_images: false  # true for sensor_msgs/CompressedImage topics
+  frame_stride: 1  # keep one of every N complete, synchronized camera groups
+
+  cam0:
+    img_topic: ""
+    Rcl: []  # 3x3 row-major LiDAR-to-camera rotation, calibrated
+    Pcl: []  # LiDAR origin expressed in camera coordinates, calibrated
+    cam_model: EquidistantCamera
+    cam_width: 0
+    cam_height: 0
+    scale: 1.0
+    cam_fx: 0.0
+    cam_fy: 0.0
+    cam_cx: 0.0
+    cam_cy: 0.0
+    k1: 0.0
+    k2: 0.0
+    k3: 0.0
+    k4: 0.0
+
+  cam1:
+    img_topic: ""
+    Rcl: []
+    Pcl: []
+    cam_model: EquidistantCamera
+    cam_width: 0
+    cam_height: 0
+    scale: 1.0
+    cam_fx: 0.0
+    cam_fy: 0.0
+    cam_cx: 0.0
+    cam_cy: 0.0
+    k1: 0.0
+    k2: 0.0
+    k3: 0.0
+    k4: 0.0
+
+  cam2:
+    img_topic: ""
+    Rcl: []
+    Pcl: []
+    cam_model: EquidistantCamera
+    cam_width: 0
+    cam_height: 0
+    scale: 1.0
+    cam_fx: 0.0
+    cam_fy: 0.0
+    cam_cx: 0.0
+    cam_cy: 0.0
+    k1: 0.0
+    k2: 0.0
+    k3: 0.0
+    k4: 0.0
+
+# Optional research path. Leave off for the original sequential multi-camera
+# baseline; validate a calibrated rig before enabling these options.
+innovations:
+  spherical_patch: false
+  shared_spherical_map: true
+  information_selection: true
+  joint_fixed_budget: true
+  max_active_cameras: 2
+  total_patch_budget: 120
+  map_insert_budget_per_camera: 30
+  spherical_probe_budget: 2048
+  joint_max_iterations: 3
+  spherical_map_max_points: 15000

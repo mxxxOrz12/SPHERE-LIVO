@@ -1,0 +1,27 @@
+#pragma once
+
+#include <algorithm>
+#include <cmath>
+#include <limits>
+
+// Twice the conventional Huber loss: its half-gradient is w(r)*r,
+// matching the frontend's IRLS normal equations (not w(r)*r*r).
+inline double sphericalHuberCost(double residual, double threshold = 20.0)
+{
+  if (!std::isfinite(residual) || !std::isfinite(threshold) || threshold <= 0)
+    return std::numeric_limits<double>::infinity();
+  const double magnitude = std::abs(residual);
+  return magnitude <= threshold ? residual * residual
+                                : threshold * (2.0 * magnitude - threshold);
+}
+
+inline bool acceptSphericalDescent(double before, double after,
+                                   double predicted_half_decrease, double step)
+{
+  if (!std::isfinite(before) || !std::isfinite(after) ||
+      !std::isfinite(predicted_half_decrease) || !std::isfinite(step) ||
+      before < 0 || after < 0 || predicted_half_decrease <= 0 || step <= 0 || step > 1)
+    return false;
+  // Cost uses twice the half-objective, hence the factor two in Armijo.
+  return after < before && after <= before - 2e-4 * step * predicted_half_decrease;
+}

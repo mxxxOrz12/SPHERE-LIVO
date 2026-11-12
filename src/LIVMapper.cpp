@@ -11,6 +11,10 @@ which is included as part of this source code package.
 */
 
 #include "LIVMapper.h"
+#include "visual_budget.h"
+#include "visual_update_guard.h"
+#include "spherical_information_selector.h"
+#include <numeric>
 
 LIVMapper::LIVMapper(ros::NodeHandle &nh)
     : extT(0, 0, 0),
@@ -38,6 +42,7 @@ LIVMapper::LIVMapper(ros::NodeHandle &nh)
   pcl_wait_save_intensity.reset(new PointCloudXYZI());
   voxelmap_manager.reset(new VoxelMapManager(voxel_config, voxel_map));
   vio_manager.reset(new VIOManager());
+  camera_vios.push_back(vio_manager);
   root_dir = ROOT_DIR;
   initializeFiles();
   initializeComponents();
@@ -55,6 +60,111 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<int>("common/img_en", img_en, 1);
   nh.param<int>("common/lidar_en", lidar_en, 1);
   nh.param<string>("common/img_topic", img_topic, "/left_camera/image");
+  nh.param<bool>("multi_fisheye/enabled", multi_fisheye_en, false);
+  nh.param<bool>("innovations/spherical_patch", spherical_patch_en, false);
+  nh.param<bool>("innovations/shared_spherical_map", shared_spherical_map_en, true);
+  nh.param<bool>("innovations/information_selection", information_selection_en, true);
+  nh.param<bool>("innovations/joint_fixed_budget", joint_fixed_budget_en, true);
+  nh.param<bool>("innovations/spherical_affine", spherical_affine_en, true);
+  nh.param<bool>("innovations/spherical_spatial_diversity", spherical_spatial_diversity_en, false);
+  nh.param<bool>("innovations/spherical_marginalize_affine", spherical_marginalize_affine_en, false);
+  nh.param<bool>("innovations/spherical_prefilter_zncc", spherical_prefilter_zncc_en, false);
+  nh.param<int>("innovations/spherical_pyramid_levels", spherical_pyramid_levels, 1);
+  nh.param<bool>("innovations/spherical_camera_affine", spherical_camera_affine_en, false);
+  nh.param<bool>("innovations/spherical_effective_information", spherical_effective_information_en, false);
+  nh.param<bool>("innovations/spherical_gain_only", spherical_gain_only_en, false);
+  nh.param<bool>("innovations/spherical_plane_anchor", spherical_plane_anchor_en, false);
+  nh.param<bool>("innovations/spherical_plane_refinement", spherical_plane_refinement_en, false);
+  nh.param<bool>("innovations/adaptive_camera_budget", adaptive_camera_budget_en, false);
+  nh.param<bool>("innovations/spherical_reference_refresh", spherical_reference_refresh_en, false);
+  nh.param<bool>("innovations/spherical_posterior_information", spherical_posterior_information_en, false);
+  nh.param<bool>("innovations/spherical_transactional_update", spherical_transactional_update_en, false);
+  nh.param<bool>("innovations/spherical_temporal_retrieval", spherical_temporal_retrieval_en, false);
+  nh.param<bool>("innovations/spherical_descent_guard", spherical_descent_guard_en, false);
+  nh.param<bool>("innovations/spherical_incremental_information", spherical_incremental_information_en, false);
+  nh.param<bool>("innovations/spherical_geometry_support", spherical_geometry_support_en, false);
+  nh.param<bool>("innovations/spherical_shared_brightness", spherical_shared_brightness_en, false);
+  nh.param<bool>("innovations/spherical_local_brightness", spherical_local_brightness_en, false);
+  nh.param<bool>("innovations/spherical_bounded_brightness", spherical_bounded_brightness_en, false);
+  if (spherical_bounded_brightness_en && (!spherical_shared_brightness_en || spherical_local_brightness_en))
+    throw std::runtime_error("Bounded exposure requires shared-only brightness (not hierarchical local shading)");
+  if (spherical_local_brightness_en && !spherical_shared_brightness_en)
+    throw std::runtime_error("Local shading requires shared camera brightness");
+  if (spherical_incremental_information_en && (!spherical_posterior_information_en || !information_selection_en))
+    throw std::runtime_error("Incremental selection requires posterior information selection");
+  if (spherical_geometry_support_en && (spherical_plane_refinement_en || spherical_reference_refresh_en))
+    throw std::runtime_error("Geometry support cache cannot be combined with unvalidated reference/geometry refresh");
+  if (spherical_descent_guard_en) spherical_transactional_update_en = true;
+  if (spherical_pyramid_levels < 1 || spherical_pyramid_levels > 4)
+    throw std::runtime_error("spherical_pyramid_levels must be in [1, 4]");
+  nh.param<double>("innovations/spherical_min_zncc", spherical_min_zncc, -1.0);
+  nh.param<int>("innovations/max_active_cameras", max_active_cameras, 2);
+  if (spherical_shared_brightness_en && (!spherical_incremental_information_en || !spherical_descent_guard_en ||
+      spherical_gain_only_en || !spherical_affine_en || max_active_cameras > 3 || spherical_reference_refresh_en))
+    throw std::runtime_error("Shared brightness requires affine/incremental/guard mode with at most three cameras and no reference refresh");
+  nh.param<int>("innovations/total_patch_budget", total_patch_budget, 120);
+  nh.param<int>("innovations/map_insert_budget_per_camera", map_insert_budget_per_camera, 30);
+  nh.param<int>("innovations/spherical_probe_budget", spherical_probe_budget, 2048);
+  nh.param<int>("innovations/joint_max_iterations", joint_max_iterations, 3);
+  nh.param<int>("innovations/spherical_map_max_points", spherical_map_max_points, 15000);
+  if (spherical_patch_en && (!multi_fisheye_en || max_active_cameras < 1 ||
+      total_patch_budget < 1 || map_insert_budget_per_camera < 1 ||
+      spherical_probe_budget < 1 || joint_max_iterations < 1 || spherical_map_max_points < 1))
+    throw std::runtime_error("Invalid spherical multi-fisheye innovation configuration");
+  if (!std::isfinite(spherical_min_zncc) || spherical_min_zncc > 1.0)
+    throw std::runtime_error("spherical_min_zncc must be finite and <= 1");
+  if (multi_fisheye_en)
+  {
+    nh.param<int>("multi_fisheye/camera_count", camera_count, 3);
+    nh.param<double>("multi_fisheye/sync_tolerance", camera_sync_tolerance, 0.005);
+    nh.param<bool>("multi_fisheye/compressed_images", compressed_images, false);
+    nh.param<int>("multi_fisheye/frame_stride", camera_frame_stride, 1);
+    if (camera_count < 2 || camera_count > 6 || camera_sync_tolerance <= 0.0 || camera_frame_stride < 1)
+      throw std::runtime_error("multi_fisheye requires 2-6 cameras, positive sync_tolerance and frame_stride >= 1");
+    for (int i = 0; i < camera_count; ++i)
+    {
+      const std::string ns = "multi_fisheye/cam" + std::to_string(i);
+      std::string topic;
+      std::vector<double> rotation, translation;
+      if (!nh.getParam(ns + "/img_topic", topic) ||
+          !nh.getParam(ns + "/Rcl", rotation) ||
+          !nh.getParam(ns + "/Pcl", translation) ||
+          topic.empty() || rotation.size() != 9 || translation.size() != 3)
+        throw std::runtime_error("Missing multi_fisheye camera topic or valid Rcl/Pcl: " + ns);
+      std::string model;
+      int width = 0, height = 0;
+      double fx = 0.0, fy = 0.0, cx = 0.0, cy = 0.0, scale = 0.0;
+      if (!nh.getParam(ns + "/cam_model", model) || model != "EquidistantCamera" ||
+          !nh.getParam(ns + "/cam_width", width) || width <= 0 ||
+          !nh.getParam(ns + "/cam_height", height) || height <= 0 ||
+          !nh.getParam(ns + "/cam_fx", fx) || !std::isfinite(fx) || fx <= 0.0 ||
+          !nh.getParam(ns + "/cam_fy", fy) || !std::isfinite(fy) || fy <= 0.0 ||
+          !nh.getParam(ns + "/cam_cx", cx) || cx < 0.0 || cx >= width ||
+          !nh.getParam(ns + "/cam_cy", cy) || cy < 0.0 || cy >= height ||
+          !nh.getParam(ns + "/scale", scale) || !std::isfinite(scale) || scale <= 0.0)
+        throw std::runtime_error("Invalid equidistant fisheye calibration: " + ns);
+      for (const char *coefficient : {"k1", "k2", "k3", "k4"})
+      {
+        double value = 0.0;
+        if (!nh.getParam(ns + "/" + coefficient, value) || !std::isfinite(value))
+          throw std::runtime_error("Missing or invalid fisheye distortion coefficient: " + ns + "/" + coefficient);
+      }
+      M3D Rcl;
+      Rcl << MAT_FROM_ARRAY(rotation);
+      if (!Rcl.allFinite() || (Rcl.transpose() * Rcl - M3D::Identity()).norm() > 0.05 ||
+          std::abs(Rcl.determinant() - 1.0) > 0.05 ||
+          !std::all_of(translation.begin(), translation.end(), [](double value) { return std::isfinite(value); }))
+        throw std::runtime_error("Invalid camera extrinsic transform: " + ns);
+      if (std::find(camera_topics.begin(), camera_topics.end(), topic) != camera_topics.end())
+        throw std::runtime_error("Duplicate multi_fisheye image topic: " + topic);
+      camera_topics.push_back(topic);
+      camera_extrinsics_R.push_back(rotation);
+      camera_extrinsics_T.push_back(translation);
+    }
+    last_camera_timestamps.assign(camera_count, -1.0);
+    camera_frame_buffers.resize(camera_count);
+    img_topic = camera_topics.front();
+  }
 
   nh.param<bool>("vio/normal_en", normal_en, true);
   nh.param<bool>("vio/inverse_composition_en", inverse_composition_en, false);
@@ -100,6 +210,8 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<int>("image_save/interval", img_save_interval, 1);
 
   nh.param<bool>("pcd_save/colmap_output_en", colmap_output_en, false);
+  if (multi_fisheye_en && colmap_output_en)
+    throw std::runtime_error("COLMAP export assumes a pinhole camera; disable it for multi_fisheye");
   nh.param<double>("pcd_save/filter_size_pcd", filter_size_pcd, 0.5);
   nh.param<vector<double>>("extrin_calib/extrinsic_T", extrinT, vector<double>());
   nh.param<vector<double>>("extrin_calib/extrinsic_R", extrinR, vector<double>());
@@ -125,26 +237,43 @@ void LIVMapper::initializeComponents()
   voxelmap_manager->extT_ << VEC_FROM_ARRAY(extrinT);
   voxelmap_manager->extR_ << MAT_FROM_ARRAY(extrinR);
 
-  if (!vk::camera_loader::loadFromRosNs("laserMapping", vio_manager->cam)) throw std::runtime_error("Camera model not correctly specified.");
-
-  vio_manager->grid_size = grid_size;
-  vio_manager->patch_size = patch_size;
-  vio_manager->outlier_threshold = outlier_threshold;
-  vio_manager->setImuToLidarExtrinsic(extT, extR);
-  vio_manager->setLidarToCameraExtrinsic(cameraextrinR, cameraextrinT);
-  vio_manager->state = &_state;
-  vio_manager->state_propagat = &state_propagat;
-  vio_manager->max_iterations = max_iterations;
-  vio_manager->img_point_cov = IMG_POINT_COV;
-  vio_manager->normal_en = normal_en;
-  vio_manager->inverse_composition_en = inverse_composition_en;
-  vio_manager->raycast_en = raycast_en;
-  vio_manager->grid_n_width = grid_n_width;
-  vio_manager->grid_n_height = grid_n_height;
-  vio_manager->patch_pyrimid_level = patch_pyrimid_level;
-  vio_manager->exposure_estimate_en = exposure_estimate_en;
-  vio_manager->colmap_output_en = colmap_output_en;
-  vio_manager->initializeVIO();
+  for (int i = 0; i < camera_count; ++i)
+  {
+    if (i > 0) camera_vios.emplace_back(new VIOManager());
+    VIOManagerPtr manager = camera_vios[i];
+    const std::string camera_ns = multi_fisheye_en ?
+        "multi_fisheye/cam" + std::to_string(i) : "laserMapping";
+    if (!vk::camera_loader::loadFromRosNs(camera_ns, manager->cam))
+      throw std::runtime_error("Camera model not correctly specified: " + camera_ns);
+    manager->grid_size = grid_size;
+    manager->patch_size = patch_size;
+    manager->outlier_threshold = outlier_threshold;
+    manager->setImuToLidarExtrinsic(extT, extR);
+    if (multi_fisheye_en)
+      manager->setLidarToCameraExtrinsic(camera_extrinsics_R[i], camera_extrinsics_T[i]);
+    else
+      manager->setLidarToCameraExtrinsic(cameraextrinR, cameraextrinT);
+    manager->state = &_state;
+    manager->state_propagat = &state_propagat;
+    manager->max_iterations = max_iterations;
+    manager->img_point_cov = IMG_POINT_COV;
+    manager->normal_en = normal_en;
+    manager->inverse_composition_en = inverse_composition_en;
+    manager->raycast_en = raycast_en;
+    manager->grid_n_width = grid_n_width;
+    manager->grid_n_height = grid_n_height;
+    manager->patch_pyrimid_level = patch_pyrimid_level;
+    // The original 19-state filter has only one exposure variable. Multiple
+    // cameras therefore require fixed, calibrated exposure in this baseline.
+    manager->exposure_estimate_en = multi_fisheye_en ? false : exposure_estimate_en;
+    manager->colmap_output_en = (i == 0) && colmap_output_en;
+    manager->initializeVIO();
+    manager->camera_id = static_cast<int>(i);
+    manager->spherical_plane_anchor_en = spherical_plane_anchor_en;
+    manager->spherical_map->max_points = static_cast<size_t>(spherical_map_max_points);
+    if (i > 0 && spherical_patch_en && shared_spherical_map_en)
+      manager->spherical_map = camera_vios[0]->spherical_map;
+  }
 
   p_imu->set_extrinsic(extT, extR);
   p_imu->set_gyr_cov_scale(V3D(gyr_cov, gyr_cov, gyr_cov));
@@ -157,7 +286,7 @@ void LIVMapper::initializeComponents()
   if (!imu_en) p_imu->disable_imu();
   if (!gravity_est_en) p_imu->disable_gravity_est();
   if (!ba_bg_est_en) p_imu->disable_bias_est();
-  if (!exposure_estimate_en) p_imu->disable_exposure_est();
+  if (!exposure_estimate_en || multi_fisheye_en) p_imu->disable_exposure_est();
 
   slam_mode_ = (img_en && lidar_en) ? LIVO : imu_en ? ONLY_LIO : ONLY_LO;
 }
@@ -187,6 +316,11 @@ void LIVMapper::initializeFiles()
   if(img_save_en) fout_visual_pos.open(std::string(ROOT_DIR) + "Log/image/image_poses.txt", std::ios::out);
   fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"), std::ios::out);
   fout_out.open(DEBUG_FILE_DIR("mat_out.txt"), std::ios::out);
+  if (multi_fisheye_en)
+  {
+    fout_vio_timing.open(std::string(ROOT_DIR) + "Log/result/" + seq_name + "_timing.csv", std::ios::out);
+    fout_vio_timing << "timestamp,mode,cameras,selected_patches,vio_ms,map_points,active_ids,lidar_weak_ratio,camera_scores,accepted_patches,camera_quotas,refreshed_patches,temporal_selected_patches,guard_accepted_steps,guard_rejected_steps,guard_backtracks,guard_initial_cost,guard_final_cost,guard_status,incremental_pool_size,unique_world_patches,geometry_fine_rejections,geometry_coarse_rejections,brightness_gains,brightness_biases,brightness_fit_rejections,brightness_bound_fits\n";
+  }
 }
 
 void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_transport::ImageTransport &it) 
@@ -195,7 +329,24 @@ void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_tr
             nh.subscribe(lid_topic, 200000, &LIVMapper::livox_pcl_cbk, this): 
             nh.subscribe(lid_topic, 200000, &LIVMapper::standard_pcl_cbk, this);
   sub_imu = nh.subscribe(imu_topic, 200000, &LIVMapper::imu_cbk, this);
-  sub_img = nh.subscribe(img_topic, 200000, &LIVMapper::img_cbk, this);
+  if (multi_fisheye_en)
+  {
+    for (int i = 0; i < camera_count; ++i)
+    {
+      if (compressed_images)
+        camera_subscribers.push_back(nh.subscribe<sensor_msgs::CompressedImage>(
+            camera_topics[i], 30,
+            [this, i](const sensor_msgs::CompressedImageConstPtr &msg) { compressed_img_cbk(msg, i); }));
+      else
+        camera_subscribers.push_back(nh.subscribe<sensor_msgs::Image>(
+            camera_topics[i], 30,
+            [this, i](const sensor_msgs::ImageConstPtr &msg) { img_cbk(msg, i); }));
+    }
+  }
+  else
+    sub_img = nh.subscribe<sensor_msgs::Image>(
+        img_topic, 200000,
+        [this](const sensor_msgs::ImageConstPtr &msg) { img_cbk(msg, 0); });
   
   pubLaserCloudFullRes = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered", 100);
   pubNormal = nh.advertise<visualization_msgs::MarkerArray>("visualization_marker", 100);
@@ -293,16 +444,76 @@ void LIVMapper::handleVIO()
     
   std::cout << "[ VIO ] Raw feature num: " << pcl_w_wait_pub->points.size() << std::endl;
 
-  if (fabs((LidarMeasures.last_lio_update_time - _first_lidar_time) - plot_time) < (frame_cnt / 2 * 0.1)) 
+  const bool plot_visual = fabs((LidarMeasures.last_lio_update_time - _first_lidar_time) - plot_time) < (frame_cnt / 2 * 0.1);
+  const auto &images = LidarMeasures.measures.back().camera_images;
+  if (images.size() != camera_vios.size())
   {
-    vio_manager->plot_flag = true;
-  } 
-  else 
-  {
-    vio_manager->plot_flag = false;
+    ROS_ERROR("Camera packet size does not match configured camera count");
+    return;
   }
-
-  vio_manager->processFrame(LidarMeasures.measures.back().img, _pv_list, voxelmap_manager->voxel_map_, LidarMeasures.last_lio_update_time - _first_lidar_time);
+  const double vio_start_time = omp_get_wtime();
+  if (spherical_patch_en)
+    runSphericalVIO(images);
+  else
+    for (size_t i = 0; i < camera_vios.size(); ++i)
+    {
+      camera_vios[i]->plot_flag = plot_visual;
+      cv::Mat image = images[i];
+      camera_vios[i]->processFrame(image, _pv_list, voxelmap_manager->voxel_map_,
+                                   LidarMeasures.last_lio_update_time - _first_lidar_time);
+    }
+  const double vio_elapsed_ms = (omp_get_wtime() - vio_start_time) * 1000.0;
+  if (fout_vio_timing.is_open())
+  {
+    size_t map_points = 0;
+    int selected_patches = last_selected_spherical_patches;
+    int active_cameras = last_active_spherical_cameras;
+    std::string active_ids = last_active_camera_ids;
+    if (spherical_patch_en)
+    {
+      if (shared_spherical_map_en)
+        map_points = camera_vios[0]->spherical_map->voxels.size();
+      else
+        for (const auto &manager : camera_vios) map_points += manager->spherical_map->voxels.size();
+    }
+    else
+    {
+      selected_patches = 0;
+      active_cameras = static_cast<int>(camera_vios.size());
+      std::ostringstream ids;
+      for (size_t i = 0; i < camera_vios.size(); ++i)
+      {
+        if (i) ids << ';';
+        ids << i;
+      }
+      active_ids = ids.str();
+      for (const auto &manager : camera_vios)
+      {
+        selected_patches += manager->total_points;
+        map_points += manager->feat_map.size();
+      }
+    }
+    fout_vio_timing << std::fixed << std::setprecision(6)
+                    << LidarMeasures.last_lio_update_time << ','
+                    << (spherical_patch_en ? "spherical_joint" : "legacy_sequential") << ','
+                    << active_cameras << ',' << selected_patches << ','
+                    << vio_elapsed_ms << ',' << map_points << ','
+                    << active_ids << ','
+                    << last_lidar_weak_ratio << ',' << last_camera_scores << ','
+                    << last_accepted_spherical_patches << ',' << last_camera_quotas << ','
+                    << last_refreshed_spherical_patches << ',' << last_temporal_selected_spherical_patches << ','
+                    << last_visual_guard_accepted_steps << ',' << last_visual_guard_rejected_steps << ','
+                    << last_visual_guard_backtracks << ',' << std::setprecision(12) << last_visual_guard_initial_cost << ','
+                    << last_visual_guard_final_cost << ',' << last_visual_guard_status << ','
+                    << last_incremental_pool_size << ',' << last_unique_world_patches << ','
+                    << last_geometry_fine_rejections << ',' << last_geometry_coarse_rejections << ','
+                    << last_spherical_brightness_gains << ',' << last_spherical_brightness_biases << ','
+                    << last_brightness_fit_rejections << ',' << last_brightness_bound_fits << '\n';
+  }
+  // All camera images share a capture time. Reproject using the final fused
+  // state, including the updates from cameras processed later in the group.
+  for (const auto &manager : camera_vios)
+    manager->updateFrameState(_state);
 
   if (imu_prop_enable) 
   {
@@ -826,10 +1037,10 @@ cv::Mat LIVMapper::getImageFromMsg(const sensor_msgs::ImageConstPtr &img_msg)
   return img;
 }
 
-void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in)
+void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in, size_t camera_id)
 {
   if (!img_en) return;
-  sensor_msgs::Image::Ptr msg(new sensor_msgs::Image(*msg_in));
+  if (camera_id >= static_cast<size_t>(camera_count)) return;
   // if ((abs(msg->header.stamp.toSec() - last_timestamp_img) > 0.2 && last_timestamp_img > 0) || sync_jump_flag)
   // {
   //   ROS_WARN("img jumps %.3f\n", msg->header.stamp.toSec() - last_timestamp_img);
@@ -840,11 +1051,24 @@ void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in)
   // Hiliti2022 40Hz
   if (hilti_en)
   {
-    static int frame_counter = 0;
-    if (++frame_counter % 4 != 0) return;
+    if (!multi_fisheye_en)
+    {
+      static int frame_counter = 0;
+      if (++frame_counter % 4 != 0) return;
+    }
   }
   // double msg_header_time =  msg->header.stamp.toSec();
-  double msg_header_time = msg->header.stamp.toSec() + img_time_offset;
+  double msg_header_time = msg_in->header.stamp.toSec() + img_time_offset;
+  if (multi_fisheye_en)
+  {
+    if (last_timestamp_lidar < 0) return;
+    try { enqueueMultiFisheyeImage(getImageFromMsg(msg_in), msg_header_time, camera_id); }
+    catch (const std::exception &error)
+    {
+      ROS_WARN_THROTTLE(5.0, "Failed to decode raw fisheye image: %s", error.what());
+    }
+    return;
+  }
   if (abs(msg_header_time - last_timestamp_img) < 0.001) return;
   ROS_INFO("Get image, its header time: %.6f", msg_header_time);
   if (last_timestamp_lidar < 0) return;
@@ -867,18 +1091,545 @@ void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in)
     return;
   }
 
-  cv::Mat img_cur = getImageFromMsg(msg);
+  cv::Mat img_cur = getImageFromMsg(msg_in);
   img_buffer.push_back(img_cur);
+  img_group_buffer.push_back({img_cur});
   img_time_buffer.push_back(img_time_correct);
 
-  // ROS_INFO("Correct Image time: %.6f", img_time_correct);
-
   last_timestamp_img = img_time_correct;
-  // cv::imshow("img", img);
-  // cv::waitKey(1);
-  // cout<<"last_timestamp_img:::"<<last_timestamp_img<<endl;
   mtx_buffer.unlock();
   sig_buffer.notify_all();
+}
+
+void LIVMapper::runSphericalVIO(const std::vector<cv::Mat> &images)
+{
+  last_selected_spherical_patches = 0;
+  last_accepted_spherical_patches = 0;
+  last_active_spherical_cameras = 0;
+  last_active_camera_ids.clear();
+  last_camera_scores.clear();
+  last_camera_quotas.clear();
+  last_refreshed_spherical_patches = 0;
+  last_temporal_selected_spherical_patches = 0;
+  last_lidar_weak_ratio = -1.0;
+  last_visual_guard_accepted_steps = 0;
+  last_visual_guard_rejected_steps = 0;
+  last_visual_guard_backtracks = 0;
+  last_visual_guard_initial_cost = -1.0;
+  last_visual_guard_final_cost = -1.0;
+  last_visual_guard_status = spherical_descent_guard_en ? "prior_kept" : "disabled";
+  last_incremental_pool_size = 0;
+  last_unique_world_patches = 0;
+  last_geometry_fine_rejections = 0;
+  last_geometry_coarse_rejections = 0;
+  last_brightness_fit_rejections = 0;
+  last_brightness_bound_fits = 0;
+  // The smallest eigenvector of LiDAR's weighted translational Hessian is
+  // the direction along which this scan provides the least information.
+  V3D weak_world = V3D::UnitX();
+  const M3D lidar_info = 0.5 * (voxelmap_manager->last_lidar_translation_information_ +
+                                voxelmap_manager->last_lidar_translation_information_.transpose());
+  Eigen::SelfAdjointEigenSolver<M3D> lidar_eigensystem(lidar_info);
+  if (lidar_eigensystem.info() == Eigen::Success &&
+      lidar_eigensystem.eigenvalues().allFinite() &&
+      lidar_eigensystem.eigenvalues()[2] > 1e-8)
+  {
+    weak_world = lidar_eigensystem.eigenvectors().col(0);
+    last_lidar_weak_ratio = lidar_eigensystem.eigenvalues()[0] /
+                            lidar_eigensystem.eigenvalues()[2];
+  }
+  else
+  {
+    Eigen::SelfAdjointEigenSolver<M3D> covariance_eigensystem(_state.cov.block<3, 3>(3, 3));
+    if (covariance_eigensystem.info() == Eigen::Success)
+      weak_world = covariance_eigensystem.eigenvectors().col(2);
+  }
+
+  if (spherical_plane_refinement_en)
+  {
+    if (shared_spherical_map_en)
+      camera_vios[0]->refineSphericalGeometry(_pv_list, spherical_probe_budget);
+    else
+      for (const auto &manager : camera_vios)
+        manager->refineSphericalGeometry(_pv_list, spherical_probe_budget);
+  }
+  std::vector<std::shared_ptr<SphericalPatchPoint>> temporal_seeds;
+  std::unordered_set<const SphericalPatchPoint *> temporal_seed_ids;
+  if (spherical_temporal_retrieval_en)
+  {
+    for (const auto &manager : camera_vios)
+      for (const auto &observation : manager->spherical_selected)
+        if (temporal_seed_ids.insert(observation.point.get()).second)
+          temporal_seeds.push_back(observation.point);
+  }
+  MD(6, 6) posterior_factor = MD(6, 6)::Zero();
+  bool posterior_factor_valid = false;
+  if (spherical_posterior_information_en)
+  {
+    const MD(6, 6) covariance = _state.cov.block<6, 6>(0, 0);
+    Eigen::LLT<MD(6, 6)> factor(0.5 * (covariance + covariance.transpose()).eval() / IMG_POINT_COV);
+    if (factor.info() == Eigen::Success)
+    {
+      posterior_factor = factor.matrixL();
+      posterior_factor_valid = posterior_factor.allFinite();
+    }
+  }
+  for (const auto &manager : camera_vios)
+  {
+    manager->spherical_geometry_support_en = spherical_geometry_support_en;
+    manager->spherical_shared_brightness_en = spherical_shared_brightness_en;
+    manager->spherical_local_brightness_en = spherical_local_brightness_en;
+    manager->spherical_bounded_brightness_en = spherical_bounded_brightness_en;
+    manager->spherical_plane_associations = &voxelmap_manager->ptpl_list_;
+  }
+  for (size_t i = 0; i < camera_vios.size(); ++i)
+    camera_vios[i]->prepareSphericalFrame(images[i], _pv_list, weak_world,
+                                           information_selection_en, spherical_probe_budget,
+                                           spherical_prefilter_zncc_en ? spherical_min_zncc : -1.0,
+                                           spherical_pyramid_levels, spherical_effective_information_en,
+                                           spherical_gain_only_en,
+                                           posterior_factor_valid ? &posterior_factor : nullptr,
+                                           spherical_temporal_retrieval_en ? &temporal_seeds : nullptr);
+
+  std::vector<size_t> order(camera_vios.size());
+  std::iota(order.begin(), order.end(), 0);
+  auto camera_score = [this](size_t i)
+  {
+    const auto &candidates = camera_vios[i]->spherical_candidates;
+    const size_t count = std::min<size_t>(16, candidates.size());
+    double score = 0.0;
+    for (size_t j = 0; j < count; ++j) score += candidates[j].score;
+    return score;
+  };
+  std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return camera_score(a) > camera_score(b); });
+  std::ostringstream scores;
+  for (size_t i = 0; i < camera_vios.size(); ++i)
+  {
+    if (i) scores << ';';
+    scores << camera_score(i);
+  }
+  last_camera_scores = scores.str();
+  std::vector<size_t> active;
+  for (size_t index : order)
+  {
+    if (camera_vios[index]->spherical_candidates.empty()) continue;
+    active.push_back(index);
+    if (active.size() >= static_cast<size_t>(max_active_cameras)) break;
+  }
+  if (spherical_incremental_information_en && posterior_factor_valid)
+  {
+    std::vector<SphericalInformationCandidate> pool;
+    std::vector<std::pair<size_t, size_t>> observation_ids;
+    const size_t per_camera = std::max<size_t>(1, 360/camera_vios.size());
+    for (size_t index : order)
+    {
+      const auto &candidates = camera_vios[index]->spherical_candidates;
+      for (size_t j = 0; j < std::min(per_camera, candidates.size()) && pool.size() < 360; ++j)
+      {
+        pool.push_back({candidates[j].posterior_information, index,
+                       reinterpret_cast<std::uintptr_t>(candidates[j].point.get()),
+                       candidates[j].brightness_coupling,candidates[j].brightness_information});
+        observation_ids.emplace_back(index, j);
+      }
+    }
+    last_incremental_pool_size = static_cast<int>(pool.size());
+    const auto selected = selectSphericalInformation(pool, total_patch_budget, max_active_cameras);
+    std::vector<int> camera_quotas(camera_vios.size(), 0);
+    for (size_t id : selected)
+    {
+      const auto &location = observation_ids[id];
+      camera_vios[location.first]->spherical_selected.push_back(camera_vios[location.first]->spherical_candidates[location.second]);
+      ++camera_quotas[location.first];
+    }
+    active.clear();
+    std::ostringstream quota_log;
+    for (size_t i = 0; i < camera_quotas.size(); ++i)
+    {
+      if (i) quota_log << ';';
+      quota_log << camera_quotas[i];
+      if (camera_quotas[i]) active.push_back(i);
+    }
+    last_camera_quotas = quota_log.str();
+  }
+  else if (!active.empty())
+  {
+    std::vector<int> quotas(active.size(), 0);
+    if (adaptive_camera_budget_en)
+    {
+      std::vector<double> strengths;
+      std::vector<int> capacities;
+      for (size_t index : active)
+      {
+        strengths.push_back(camera_score(index));
+        capacities.push_back(static_cast<int>(camera_vios[index]->spherical_candidates.size()));
+      }
+      quotas = allocateVisualBudget(strengths, capacities, total_patch_budget);
+    }
+    else
+    {
+      int remaining = total_patch_budget;
+      for (size_t i = 0; i < active.size(); ++i)
+      {
+        const int budget = remaining / static_cast<int>(active.size() - i);
+        quotas[i] = std::min<int>(budget, camera_vios[active[i]]->spherical_candidates.size());
+        remaining -= quotas[i];
+      }
+    }
+    std::vector<int> camera_quotas(camera_vios.size(), 0);
+    for (size_t i = 0; i < active.size(); ++i)
+    {
+      camera_vios[active[i]]->selectSphericalObservations(quotas[i], spherical_spatial_diversity_en);
+      camera_quotas[active[i]] = quotas[i];
+    }
+    std::ostringstream quota_log;
+    for (size_t i = 0; i < camera_quotas.size(); ++i)
+    {
+      if (i) quota_log << ';';
+      quota_log << camera_quotas[i];
+    }
+    last_camera_quotas = quota_log.str();
+  }
+  last_active_spherical_cameras = static_cast<int>(active.size());
+  std::ostringstream active_ids;
+  for (size_t i = 0; i < active.size(); ++i)
+  {
+    if (i) active_ids << ';';
+    active_ids << active[i];
+  }
+  last_active_camera_ids = active_ids.str();
+  for (size_t index : active)
+    last_selected_spherical_patches += static_cast<int>(camera_vios[index]->spherical_selected.size());
+  for (size_t index : active)
+    for (const auto &observation : camera_vios[index]->spherical_selected)
+      if (temporal_seed_ids.count(observation.point.get())) ++last_temporal_selected_spherical_patches;
+  // Two cameras can observe the same world patch. Keep both residuals, but
+  // split their weight to avoid counting shared reference noise twice.
+  std::unordered_map<const SphericalPatchPoint *, int> multiplicity;
+  for (size_t index : active)
+    for (const auto &observation : camera_vios[index]->spherical_selected)
+      ++multiplicity[observation.point.get()];
+  last_unique_world_patches = static_cast<int>(multiplicity.size());
+  for (size_t index : active)
+    for (auto &observation : camera_vios[index]->spherical_selected)
+      observation.weight = 1.0 / multiplicity[observation.point.get()];
+
+  auto update_from_cameras = [this](const std::vector<size_t> &indices)
+  {
+    if (indices.empty()) return;
+    const StatesGroup prior_state = _state;
+    const MD(DIM_STATE, DIM_STATE) prior_information = prior_state.cov.inverse();
+    MD(6, 6) visual_information = MD(6, 6)::Zero();
+    MD(6, 1) visual_gradient = MD(6, 1)::Zero();
+    int accepted_patches = 0;
+    MD(6, 6) posterior_visual_information = MD(6, 6)::Zero();
+    bool have_visual_update = false;
+    std::vector<std::vector<SphericalCostPatch>> transaction_support(indices.size());
+    auto fixed_cost = [&](StatesGroup pose, const std::vector<std::vector<SphericalCostPatch>> &support,
+                          double &objective, bool fitted_brightness = false)
+    {
+      const MD(DIM_STATE, 1) delta = pose - prior_state;
+      objective = delta.dot(prior_information * delta);
+      double visual_cost = 0.0;
+      for (size_t j = 0; j < indices.size(); ++j)
+        if (!camera_vios[indices[j]]->evaluateSphericalCost(pose, support[j], visual_cost, fitted_brightness)) return false;
+      objective += visual_cost / IMG_POINT_COV;
+      return std::isfinite(objective);
+    };
+    if (spherical_descent_guard_en)
+    {
+      // Also freeze a finest-level set at the LIO prior. Final acceptance on
+      // this original set prevents gradual support loss across iterations.
+      MD(6, 6) unused_information = MD(6, 6)::Zero();
+      MD(6, 1) unused_gradient = MD(6, 1)::Zero();
+      double unused_cost = 0.0;
+      int support_count = 0;
+      for (size_t j = 0; j < indices.size(); ++j)
+        camera_vios[indices[j]]->linearizeSpherical(unused_information, unused_gradient, unused_cost,
+            support_count, spherical_affine_en, spherical_min_zncc, spherical_marginalize_affine_en,
+            0, spherical_camera_affine_en, spherical_gain_only_en, &transaction_support[j]);
+      if (spherical_shared_brightness_en)
+        for (size_t j = 0; j < indices.size(); ++j)
+          for (auto &sample : transaction_support[j])
+          {
+            sample.gain = camera_vios[indices[j]]->spherical_brightness_prior_gain;
+            sample.bias = camera_vios[indices[j]]->spherical_brightness_prior_bias;
+            sample.global_gain = sample.gain;
+            sample.global_bias = sample.bias;
+            sample.local_brightness.setZero();
+          }
+      if (support_count < 5 || !fixed_cost(prior_state, transaction_support, last_visual_guard_initial_cost))
+      { last_visual_guard_status = "initial_support_rejected"; return; }
+    }
+    // Re-use the same LIO prior at all scales. Coarse levels provide an
+    // initialization, not independent measurements added to the covariance.
+    for (int level = spherical_pyramid_levels - 1; level >= 0; --level)
+    for (int iteration = 0; iteration < joint_max_iterations; ++iteration)
+    {
+      visual_information.setZero();
+      visual_gradient.setZero();
+      double cost = 0.0;
+      accepted_patches = 0;
+      std::vector<std::vector<SphericalCostPatch>> iteration_support(indices.size());
+      for (size_t j = 0; j < indices.size(); ++j)
+        camera_vios[indices[j]]->linearizeSpherical(visual_information, visual_gradient,
+                                                cost, accepted_patches, spherical_affine_en,
+                                                spherical_min_zncc, spherical_marginalize_affine_en, level,
+                                                spherical_camera_affine_en, spherical_gain_only_en,
+                                                spherical_descent_guard_en ? &iteration_support[j] : nullptr);
+      last_accepted_spherical_patches = accepted_patches;
+      if (accepted_patches < 5)
+      {
+        if (spherical_transactional_update_en && have_visual_update)
+        {
+          // A partially applied mean with the old covariance is not a valid
+          // posterior. Reject the complete visual transaction, not just its
+          // final iteration, when the linearization loses support.
+          _state = prior_state;
+          if (spherical_descent_guard_en) last_visual_guard_status = "support_rejected";
+          ROS_WARN_THROTTLE(5.0, "Spherical visual transaction rejected: insufficient support");
+          return;
+        }
+        if (spherical_pyramid_levels == 1) return;
+        break;
+      }
+      MD(DIM_STATE, DIM_STATE) system = prior_information;
+      system.block<6, 6>(0, 0) += visual_information / IMG_POINT_COV;
+      const MD(DIM_STATE, 1) prior_delta = _state - prior_state;
+      MD(DIM_STATE, 1) rhs = prior_information * prior_delta;
+      rhs.block<6, 1>(0, 0) += visual_gradient / IMG_POINT_COV;
+      MD(DIM_STATE, 1) increment = -system.ldlt().solve(rhs);
+      if (!increment.allFinite())
+      {
+        if (spherical_transactional_update_en) _state = prior_state;
+        return;
+      }
+      const double angle = increment.block<3, 1>(0, 0).norm();
+      const double translation = increment.block<3, 1>(3, 0).norm();
+      const double damping = std::min(1.0, std::min(0.03 / std::max(angle, 1e-12),
+                                                   0.08 / std::max(translation, 1e-12)));
+      increment *= damping;
+      double accepted_step = 1.0;
+      if (spherical_descent_guard_en)
+      {
+        const StatesGroup before_state = _state;
+        double before_cost = 0.0;
+        const double predicted_half_decrease = -rhs.dot(increment);
+        bool accepted = false;
+        if (fixed_cost(before_state, iteration_support, before_cost))
+        for (int trial_index = 0; trial_index < 6; ++trial_index)
+        {
+          accepted_step = std::ldexp(1.0, -trial_index);
+          StatesGroup trial_state = before_state;
+          const MD(DIM_STATE, 1) trial_increment = accepted_step * increment;
+          trial_state += trial_increment;
+          double trial_cost = 0.0;
+          if (fixed_cost(trial_state, iteration_support, trial_cost) &&
+              acceptSphericalDescent(before_cost, trial_cost, predicted_half_decrease, accepted_step))
+          {
+            _state = trial_state;
+            accepted = true;
+            ++last_visual_guard_accepted_steps;
+            break;
+          }
+          ++last_visual_guard_backtracks;
+        }
+        if (!accepted)
+        {
+          _state = before_state;
+          ++last_visual_guard_rejected_steps;
+          // Keep preceding accepted increments only if the final transaction
+          // check also passes; no covariance is committed for a failed step.
+          break;
+        }
+      }
+      else _state += increment;
+      posterior_visual_information = visual_information;
+      have_visual_update = true;
+      if (angle * damping * accepted_step < 1e-4 && translation * damping * accepted_step < 1e-4) break;
+    }
+    if (!have_visual_update)
+    {
+      if (spherical_shared_brightness_en && fixed_cost(_state,transaction_support,last_visual_guard_final_cost,true) &&
+          last_visual_guard_final_cost < last_visual_guard_initial_cost)
+      {
+        for (size_t index : indices)
+        {
+          camera_vios[index]->spherical_brightness_gain = camera_vios[index]->spherical_fitted_brightness_gain;
+          camera_vios[index]->spherical_brightness_bias = camera_vios[index]->spherical_fitted_brightness_bias;
+        }
+        last_visual_guard_status = "photo_only_committed";
+      }
+      return;
+    }
+    if (spherical_transactional_update_en)
+    {
+      // Form the reported covariance at the committed pose, rather than at
+      // the previous iterate. Use the same prior once, not once per step.
+      posterior_visual_information.setZero();
+      visual_gradient.setZero();
+      double final_cost = 0;
+      accepted_patches = 0;
+      for (size_t index : indices)
+        camera_vios[index]->linearizeSpherical(posterior_visual_information, visual_gradient,
+                                               final_cost, accepted_patches, spherical_affine_en,
+                                               spherical_min_zncc, spherical_marginalize_affine_en, 0,
+                                               spherical_camera_affine_en, spherical_gain_only_en);
+      last_accepted_spherical_patches = accepted_patches;
+      if (accepted_patches < 5 || !posterior_visual_information.allFinite())
+      {
+        _state = prior_state;
+        if (spherical_descent_guard_en) last_visual_guard_status = "final_support_rejected";
+        return;
+      }
+    }
+    MD(DIM_STATE, DIM_STATE) system = prior_information;
+    system.block<6, 6>(0, 0) += posterior_visual_information / IMG_POINT_COV;
+    if (spherical_descent_guard_en &&
+        (!fixed_cost(_state,transaction_support,last_visual_guard_final_cost,spherical_shared_brightness_en) ||
+         last_visual_guard_final_cost >= last_visual_guard_initial_cost))
+    {
+      _state = prior_state;
+      last_visual_guard_status = "final_cost_rejected";
+      return;
+    }
+    if (spherical_transactional_update_en)
+    {
+      Eigen::LLT<MD(DIM_STATE, DIM_STATE)> factor(0.5 * (system + system.transpose()).eval());
+      if (factor.info() != Eigen::Success)
+      { _state = prior_state; return; }
+      const MD(DIM_STATE, DIM_STATE) covariance = factor.solve(MD(DIM_STATE, DIM_STATE)::Identity());
+      if (!covariance.allFinite()) { _state = prior_state; return; }
+      _state.cov = 0.5 * (covariance + covariance.transpose()).eval();
+    }
+    else
+    {
+    _state.cov = system.inverse();
+    _state.cov = 0.5 * (_state.cov + _state.cov.transpose()).eval();
+    }
+    if (spherical_descent_guard_en) last_visual_guard_status = "committed";
+    if (spherical_shared_brightness_en)
+      for (size_t index : indices)
+      {
+        camera_vios[index]->spherical_brightness_gain = camera_vios[index]->spherical_fitted_brightness_gain;
+        camera_vios[index]->spherical_brightness_bias = camera_vios[index]->spherical_fitted_brightness_bias;
+      }
+    ROS_INFO_THROTTLE(5.0, "Spherical fusion: %d patches, %zu camera(s), budget %d",
+                      accepted_patches, indices.size(), total_patch_budget);
+  };
+
+  if (joint_fixed_budget_en)
+    update_from_cameras(active);
+  else
+    for (size_t index : active) update_from_cameras({index});
+
+  // All cameras contribute to the common visual map, including cameras not
+  // selected for this update. The insertion cap prevents map-growth spikes.
+  for (const auto &manager : camera_vios)
+  {
+    if (spherical_reference_refresh_en)
+      last_refreshed_spherical_patches += manager->refreshSphericalReferences(map_insert_budget_per_camera);
+    manager->insertSphericalMapPoints(_pv_list, map_insert_budget_per_camera,
+                                      spherical_probe_budget);
+    last_geometry_fine_rejections += manager->spherical_geometry_fine_rejections;
+    last_geometry_coarse_rejections += manager->spherical_geometry_coarse_rejections;
+    last_brightness_fit_rejections += manager->spherical_brightness_fit_rejections;
+    last_brightness_bound_fits += manager->spherical_brightness_bound_fits;
+  }
+  std::ostringstream gains,biases;
+  for (size_t i = 0; i < camera_vios.size(); ++i)
+  {
+    if (i) { gains << ';'; biases << ';'; }
+    gains << camera_vios[i]->spherical_brightness_gain;
+    biases << camera_vios[i]->spherical_brightness_bias;
+  }
+  last_spherical_brightness_gains = gains.str();
+  last_spherical_brightness_biases = biases.str();
+}
+
+void LIVMapper::compressed_img_cbk(const sensor_msgs::CompressedImageConstPtr &msg, size_t camera_id)
+{
+  if (!img_en || !multi_fisheye_en || last_timestamp_lidar < 0 ||
+      camera_id >= static_cast<size_t>(camera_count)) return;
+  if (msg->data.empty()) return;
+  try
+  {
+    const cv::Mat encoded(1, static_cast<int>(msg->data.size()), CV_8UC1,
+                          const_cast<uint8_t *>(msg->data.data()));
+    const cv::Mat image = cv::imdecode(encoded, cv::IMREAD_COLOR);
+    if (image.empty())
+    {
+      ROS_WARN_THROTTLE(5.0, "Empty decoded fisheye image on camera %zu", camera_id);
+      return;
+    }
+    enqueueMultiFisheyeImage(image, msg->header.stamp.toSec() + img_time_offset, camera_id);
+  }
+  catch (const cv::Exception &error)
+  {
+    ROS_WARN_THROTTLE(5.0, "Failed to decode compressed fisheye image: %s", error.what());
+  }
+}
+
+void LIVMapper::enqueueMultiFisheyeImage(const cv::Mat &image, double timestamp, size_t camera_id)
+{
+    std::lock_guard<std::mutex> lock(mtx_buffer);
+    if (timestamp <= last_camera_timestamps[camera_id] + 0.001) return;
+    last_camera_timestamps[camera_id] = timestamp;
+    auto &queue = camera_frame_buffers[camera_id];
+    queue.push_back({timestamp, image});
+    if (queue.size() > 30)
+    {
+      queue.pop_front();
+      ROS_WARN_THROTTLE(5.0, "Multi-fisheye image queue overflow; check camera synchronization");
+    }
+    while (true)
+    {
+      bool complete = true;
+      for (const auto &buffer : camera_frame_buffers)
+        complete = complete && !buffer.empty();
+      if (!complete) break;
+
+      double earliest = camera_frame_buffers[0].front().timestamp;
+      double latest = earliest;
+      size_t earliest_camera = 0;
+      for (size_t i = 1; i < camera_frame_buffers.size(); ++i)
+      {
+        const double t = camera_frame_buffers[i].front().timestamp;
+        if (t < earliest) { earliest = t; earliest_camera = i; }
+        latest = std::max(latest, t);
+      }
+      if (latest - earliest > camera_sync_tolerance)
+      {
+        camera_frame_buffers[earliest_camera].pop_front();
+        ROS_WARN_THROTTLE(5.0, "Dropping unsynchronized multi-fisheye image");
+        continue;
+      }
+
+      std::vector<cv::Mat> group;
+      group.reserve(camera_count);
+      double group_time = 0.0;
+      for (auto &buffer : camera_frame_buffers)
+      {
+        group_time += buffer.front().timestamp;
+        group.push_back(buffer.front().image);
+        buffer.pop_front();
+      }
+      group_time /= camera_count;
+      // Downsample complete rig groups, not independent camera streams.
+      if (++camera_group_counter % (hilti_en ? 4 : camera_frame_stride) != 0) continue;
+      if (group_time <= last_timestamp_img + 0.02) continue;
+      img_buffer.push_back(group.front());
+      img_group_buffer.push_back(std::move(group));
+      img_time_buffer.push_back(group_time);
+      last_timestamp_img = group_time;
+      if (img_group_buffer.size() > 30)
+      {
+        img_buffer.pop_front();
+        img_group_buffer.pop_front();
+        img_time_buffer.pop_front();
+        ROS_WARN_THROTTLE(5.0, "Dropping old multi-fisheye group; mapping cannot keep up");
+      }
+      sig_buffer.notify_all();
+    }
 }
 
 bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
@@ -965,6 +1716,7 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       if (img_capture_time < meas.last_lio_update_time + 0.00001)
       {
         img_buffer.pop_front();
+        img_group_buffer.pop_front();
         img_time_buffer.pop_front();
         ROS_ERROR("[ Data Cut ] Throw one image frame! \n");
         return false;
@@ -1054,6 +1806,7 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       m.vio_time = img_capture_time;
       m.lio_time = meas.last_lio_update_time;
       m.img = img_buffer.front();
+      m.camera_images = img_group_buffer.front();
       mtx_buffer.lock();
       // while ((!imu_buffer.empty() && (imu_time < img_capture_time)))
       // {
@@ -1065,6 +1818,7 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       //   imu_buffer.front()->header.stamp.toSec());
       // }
       img_buffer.pop_front();
+      img_group_buffer.pop_front();
       img_time_buffer.pop_front();
       mtx_buffer.unlock();
       sig_buffer.notify_all();
@@ -1146,7 +1900,6 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
       size_t size = pcl_wait_pub->points.size();
       laserCloudWorldRGB->reserve(size);
       // double inv_expo = _state.inv_expo_time;
-      cv::Mat img_rgb = vio_manager->img_rgb;
       for (size_t i = 0; i < size; i++)
       {
         PointTypeRGB pointRGB;
@@ -1155,12 +1908,14 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
         pointRGB.z = pcl_wait_pub->points[i].z;
 
         V3D p_w(pcl_wait_pub->points[i].x, pcl_wait_pub->points[i].y, pcl_wait_pub->points[i].z);
-        V3D pf(vio_manager->new_frame_->w2f(p_w)); if (pf[2] < 0) continue;
-        V2D pc(vio_manager->new_frame_->w2c(p_w));
-
-        if (vio_manager->new_frame_->cam_->isInFrame(pc.cast<int>(), 3)) // 100
+        for (const auto &camera_vio : camera_vios)
         {
-          V3F pixel = vio_manager->getInterpolatedPixel(img_rgb, pc);
+          if (!camera_vio->new_frame_ || camera_vio->img_rgb.empty()) continue;
+          V3D pf(camera_vio->new_frame_->w2f(p_w));
+          if (pf[2] <= 0.0) continue;
+          V2D pc(camera_vio->new_frame_->w2c(p_w));
+          if (!pc.allFinite() || !camera_vio->new_frame_->cam_->isInFrame(pc.cast<int>(), 3)) continue;
+          V3F pixel = camera_vio->getInterpolatedPixel(camera_vio->img_rgb, pc);
           pointRGB.r = pixel[2];
           pointRGB.g = pixel[1];
           pointRGB.b = pixel[0];
@@ -1169,6 +1924,7 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
           // if (pointRGB.g > 255) pointRGB.g = 255; else if (pointRGB.g < 0) pointRGB.g = 0;
           // if (pointRGB.b > 255) pointRGB.b = 255; else if (pointRGB.b < 0) pointRGB.b = 0;
           if (pf.norm() > blind_rgb_points) laserCloudWorldRGB->push_back(pointRGB);
+          break;
         }
       }
     }

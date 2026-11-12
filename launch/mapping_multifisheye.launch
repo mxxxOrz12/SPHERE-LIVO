@@ -1,0 +1,8 @@
+<launch>
+  <arg name="lidar_config" />
+  <arg name="rig_config" />
+
+  <rosparam command="load" file="$(arg lidar_config)" />
+  <rosparam command="load" file="$(arg rig_config)" />
+  <node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen" />
+</launch>
