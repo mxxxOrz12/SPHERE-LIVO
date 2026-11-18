@@ -11,7 +11,12 @@ multi_fisheye:
     img_topic: ""
     Rcl: []  # 3x3 row-major LiDAR-to-camera rotation, calibrated
     Pcl: []  # LiDAR origin expressed in camera coordinates, calibrated
+    # EquidistantCamera: field of view below 180 degrees (vikit model).
+    # WideFisheyeCamera: same k1..k4 calibration, any field of view; also set
+    # max_incidence_deg (largest ray angle from the optical axis inside the
+    # valid image circle, e.g. 100 for a 200-degree lens). Spherical patch only.
     cam_model: EquidistantCamera
+    # max_incidence_deg: 0.0
     cam_width: 0
     cam_height: 0
     scale: 1.0

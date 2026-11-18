@@ -134,7 +134,8 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
       std::string model;
       int width = 0, height = 0;
       double fx = 0.0, fy = 0.0, cx = 0.0, cy = 0.0, scale = 0.0;
-      if (!nh.getParam(ns + "/cam_model", model) || model != "EquidistantCamera" ||
+      if (!nh.getParam(ns + "/cam_model", model) ||
+          (model != "EquidistantCamera" && model != "WideFisheyeCamera") ||
           !nh.getParam(ns + "/cam_width", width) || width <= 0 ||
           !nh.getParam(ns + "/cam_height", height) || height <= 0 ||
           !nh.getParam(ns + "/cam_fx", fx) || !std::isfinite(fx) || fx <= 0.0 ||
@@ -143,12 +144,30 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
           !nh.getParam(ns + "/cam_cy", cy) || cy < 0.0 || cy >= height ||
           !nh.getParam(ns + "/scale", scale) || !std::isfinite(scale) || scale <= 0.0)
         throw std::runtime_error("Invalid equidistant fisheye calibration: " + ns);
+      WideCameraConfig wide;
+      int coefficient_index = 0;
       for (const char *coefficient : {"k1", "k2", "k3", "k4"})
       {
         double value = 0.0;
         if (!nh.getParam(ns + "/" + coefficient, value) || !std::isfinite(value))
           throw std::runtime_error("Missing or invalid fisheye distortion coefficient: " + ns + "/" + coefficient);
+        wide.k[coefficient_index++] = value;
       }
+      if (model == "WideFisheyeCamera")
+      {
+        // Incidence is measured from the optical axis; values above 90 degrees
+        // mean the lens sees behind its image plane (field of view > 180 deg).
+        if (!nh.getParam(ns + "/max_incidence_deg", wide.max_incidence_deg) ||
+            !std::isfinite(wide.max_incidence_deg) || wide.max_incidence_deg <= 0.0 ||
+            wide.max_incidence_deg >= 180.0)
+          throw std::runtime_error("WideFisheyeCamera requires max_incidence_deg in (0, 180): " + ns);
+        if (!spherical_patch_en)
+          throw std::runtime_error("WideFisheyeCamera is supported only with innovations/spherical_patch: " + ns);
+        wide.enabled = true;
+        wide.width = width; wide.height = height; wide.scale = scale;
+        wide.fx = fx; wide.fy = fy; wide.cx = cx; wide.cy = cy;
+      }
+      wide_camera_configs.push_back(wide);
       M3D Rcl;
       Rcl << MAT_FROM_ARRAY(rotation);
       if (!Rcl.allFinite() || (Rcl.transpose() * Rcl - M3D::Identity()).norm() > 0.05 ||
@@ -243,7 +262,21 @@ void LIVMapper::initializeComponents()
     VIOManagerPtr manager = camera_vios[i];
     const std::string camera_ns = multi_fisheye_en ?
         "multi_fisheye/cam" + std::to_string(i) : "laserMapping";
-    if (!vk::camera_loader::loadFromRosNs(camera_ns, manager->cam))
+    if (multi_fisheye_en && i < static_cast<int>(wide_camera_configs.size()) &&
+        wide_camera_configs[i].enabled)
+    {
+      const WideCameraConfig &c = wide_camera_configs[i];
+      auto *wide = new sphere::WideFisheyeCamera(c.width, c.height, c.scale, c.fx, c.fy, c.cx, c.cy,
+                                                 c.k[0], c.k[1], c.k[2], c.k[3], c.max_incidence_deg);
+      if (!wide->valid())
+      {
+        delete wide;
+        throw std::runtime_error("WideFisheyeCamera polynomial is not monotonic up to max_incidence_deg: " +
+                                 camera_ns);
+      }
+      manager->cam = wide;
+    }
+    else if (!vk::camera_loader::loadFromRosNs(camera_ns, manager->cam))
       throw std::runtime_error("Camera model not correctly specified: " + camera_ns);
     manager->grid_size = grid_size;
     manager->patch_size = patch_size;
@@ -1912,7 +1945,7 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
         {
           if (!camera_vio->new_frame_ || camera_vio->img_rgb.empty()) continue;
           V3D pf(camera_vio->new_frame_->w2f(p_w));
-          if (pf[2] <= 0.0) continue;
+          if (camera_vio->wide_cam ? !camera_vio->wide_cam->inCone(pf, 0.0) : pf[2] <= 0.0) continue;
           V2D pc(camera_vio->new_frame_->w2c(p_w));
           if (!pc.allFinite() || !camera_vio->new_frame_->cam_->isInFrame(pc.cast<int>(), 3)) continue;
           V3F pixel = camera_vio->getInterpolatedPixel(camera_vio->img_rgb, pc);

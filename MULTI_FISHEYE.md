@@ -12,7 +12,8 @@ intrinsic/distortion parameters and extrinsics. The template is intentionally
 invalid. `Rcl` is a row-major rotation and `Pcl` is a translation mapping LiDAR
 coordinates into camera coordinates. These are not IMU-to-camera transforms.
 
-The model expects a calibrated field of view below 180 degrees. Camera timestamps
+`cam_model: EquidistantCamera` uses the vikit model and expects a calibrated field
+of view below 180 degrees. Camera timestamps
 must share a clock; the single global image offset cannot correct independent
 camera clock offsets. Fixed camera exposure and synchronized global-shutter
 images are recommended. The inherited single exposure state is disabled in
@@ -27,6 +28,29 @@ roslaunch fast_livo mapping_multifisheye.launch \
 This generic launch loads the supplied configuration. Enable
 `innovations/spherical_patch` explicitly for SPHERE-LIVO. For Oxford Spires,
 `mapping_sphere_oxford.launch` loads the complete current preset directly.
+
+## Lenses wider than 180 degrees
+
+Set `cam_model: WideFisheyeCamera` and keep the Kannala-Brandt (equidistant
+k1..k4) calibration, for example from Kalibr `pinhole-equi`. Add
+`max_incidence_deg`, the largest angle between a ray and the optical axis that
+lies inside the valid image circle (half the usable field of view, e.g. 100 for
+200 degrees). Choose it a few degrees inside the image circle so patch gradients
+do not touch the black border.
+
+This model (`include/wide_fisheye_camera.h`) projects with
+`theta = atan2(sqrt(x^2 + y^2), z)` and back-projects to unit bearings, so rays
+behind the image plane are valid. In the spherical path, visibility becomes
+"range > 0.2 m and inside the incidence cone" instead of "depth z > 0.2 m", and
+the projection Jacobian is taken with respect to the 3D point directly. For rays
+in front of the camera it produces the same pixels as `EquidistantCamera`; with
+`EquidistantCamera` the code path is unchanged.
+
+Limits: spherical patch mode only (the legacy affine-warp path is rejected at
+startup); the polynomial must be strictly increasing up to `max_incidence_deg`
+(checked at startup); there is no vignetting model, which matters more at the
+edge of very wide lenses. `test/test_wide_fisheye_camera.cpp` checks agreement
+with the legacy model, round trips and the Jacobian up to 105 degrees.
 
 ## Method switches
 

@@ -137,6 +137,17 @@ public:
   std::vector<std::string> camera_topics;
   std::vector<std::vector<double>> camera_extrinsics_R;
   std::vector<std::vector<double>> camera_extrinsics_T;
+  // Calibration of cameras declared as cam_model: WideFisheyeCamera. Other
+  // models keep using vk::camera_loader. Indexed by camera id.
+  struct WideCameraConfig
+  {
+    bool enabled = false;
+    int width = 0, height = 0;
+    double scale = 1.0, fx = 0.0, fy = 0.0, cx = 0.0, cy = 0.0;
+    double k[4] = {0.0, 0.0, 0.0, 0.0};
+    double max_incidence_deg = 0.0;
+  };
+  std::vector<WideCameraConfig> wide_camera_configs;
   std::vector<double> last_camera_timestamps;
   int camera_group_counter = 0;
   struct TimedCameraFrame

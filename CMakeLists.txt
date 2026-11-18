@@ -145,3 +145,9 @@ target_link_libraries(fastlivo_mapping
 if(mimalloc_FOUND)
   target_link_libraries(fastlivo_mapping mimalloc)
 endif()
+# Header-only camera model checks (Eigen + vikit headers). Run with:
+#   ./devel/lib/fast_livo/test_wide_fisheye_camera   (or ctest in the package build dir)
+if(CATKIN_ENABLE_TESTING)
+  add_executable(test_wide_fisheye_camera test/test_wide_fisheye_camera.cpp)
+  add_test(NAME test_wide_fisheye_camera COMMAND test_wide_fisheye_camera)
+endif()

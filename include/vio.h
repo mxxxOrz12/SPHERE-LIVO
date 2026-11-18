@@ -23,6 +23,7 @@ which is included as part of this source code package.
 #include <vikit/robust_cost.h>
 #include <vikit/vision.h>
 #include <vikit/pinhole_camera.h>
+#include "wide_fisheye_camera.h"
 
 struct SubSparseMap
 {
@@ -156,6 +157,13 @@ public:
 
   int width, height, grid_n_width, grid_n_height, length;
   int camera_id = 0;
+  // Set in initializeVIO when the camera is a sphere::WideFisheyeCamera.
+  // Null keeps the legacy depth test (z > 0.2 m) and pinhole-style Jacobian.
+  const sphere::WideFisheyeCamera *wide_cam = nullptr;
+  // Spherical-path visibility: legacy depth test, or range plus the
+  // calibrated incidence cone for lenses that may exceed 180 degrees.
+  bool sphericalHidden(const V3D &pc) const { return wide_cam ? !wide_cam->inCone(pc, 0.2) : pc.z() <= 0.2; }
+  bool sphericalVisible(const V3D &pc) const { return wide_cam ? wide_cam->inCone(pc, 0.2) : pc.z() > 0.2; }
   double image_resize_factor;
   double fx, fy, cx, cy;
   int patch_pyrimid_level, patch_size, patch_size_total, patch_size_half, border, warp_len;

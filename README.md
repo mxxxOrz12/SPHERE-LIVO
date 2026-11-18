@@ -106,7 +106,9 @@ managed separately.
 ## Limitations
 
 Complete camera groups are required; camera dropout can stall the pipeline.
-The current fisheye model expects a calibrated field of view below 180 degrees.
+`EquidistantCamera` expects a calibrated field of view below 180 degrees. For
+wider lenses use `cam_model: WideFisheyeCamera` with `max_incidence_deg`
+(spherical patch mode only; see [camera notes](MULTI_FISHEYE.md)).
 Spherical patches assume locally planar surfaces. Camera clocks, image sizes and
 extrinsics must match the configuration. Fisheye COLMAP export is not supported
 by the inherited pinhole exporter; keep `colmap_output_en: false`.

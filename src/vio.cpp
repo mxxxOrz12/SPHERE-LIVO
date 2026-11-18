@@ -85,6 +85,7 @@ void VIOManager::initializeVIO()
 {
   visual_submap = new SubSparseMap;
 
+  wide_cam = dynamic_cast<const sphere::WideFisheyeCamera *>(cam);
   fx = cam->fx();
   fy = cam->fy();
   cx = cam->cx();
@@ -152,7 +153,7 @@ void VIOManager::initializeVIO()
           xyz = cam->cam2world(u, v);
           // Radial samples remain bounded near a fisheye image edge; retain
           // the original optical-depth convention for pinhole cameras.
-          if (dynamic_cast<const vk::EquidistantCamera *>(cam)) xyz *= d_temp;
+          if (wide_cam || dynamic_cast<const vk::EquidistantCamera *>(cam)) xyz *= d_temp;
           else xyz *= d_temp / xyz[2];
           // xyz[0] = (u - cx) / fx * d_temp;
           // xyz[1] = (v - cy) / fy * d_temp;
@@ -234,6 +235,11 @@ void VIOManager::resetGrid()
 
 void VIOManager::computeProjectionJacobian(V3D p, MD(2, 3) & J)
 {
+  if (wide_cam)
+  {
+    J = wide_cam->jacobianPoint(p);
+    return;
+  }
   const double x = p[0];
   const double y = p[1];
   const double z_inv = 1. / p[2];
@@ -329,7 +335,7 @@ void VIOManager::prepareSphericalFrame(const cv::Mat &image, const vector<pointW
   {
     if (spherical_shared_brightness_en && !patch->normalized_brightness) continue;
     const V3D point_camera = new_frame_->w2f(patch->center_w);
-    if (point_camera.z() <= 0.2) continue;
+    if (sphericalHidden(point_camera)) continue;
     const V2D pixel = cam->world2cam(point_camera);
     if (!cam->isInFrame(pixel.cast<int>(), 6)) continue;
     float intensity;
@@ -351,7 +357,7 @@ void VIOManager::prepareSphericalFrame(const cv::Mat &image, const vector<pointW
       {
         const V3D projected = new_frame_->w2f(patch->patch_world[j]);
         float value;
-        if (projected.z() <= 0.2 || !sampleGray(spherical_gray, cam->world2cam(projected), value))
+        if (sphericalHidden(projected) || !sampleGray(spherical_gray, cam->world2cam(projected), value))
         {
           visible = false;
           break;
@@ -389,7 +395,7 @@ void VIOManager::prepareSphericalFrame(const cv::Mat &image, const vector<pointW
       {
         const V3D pc = new_frame_->w2f(patch->patch_world[j]);
         V2D derivative;
-        if (pc.z() <= 0.2 || !sampleGrayGradient(spherical_gray, cam->world2cam(pc), values[j], derivative))
+        if (sphericalHidden(pc) || !sampleGrayGradient(spherical_gray, cam->world2cam(pc), values[j], derivative))
         { visible = false; break; }
         MD(2, 3) projection;
         computeProjectionJacobian(pc, projection);
@@ -457,7 +463,7 @@ void VIOManager::prepareSphericalFrame(const cv::Mat &image, const vector<pointW
       {
         const V3D pc = new_frame_->w2f(patch->patch_world[j]);
         V2D image_derivative;
-        if (pc.z() <= 0.2 || !sampleGrayGradient(spherical_gray, cam->world2cam(pc), current[j], image_derivative))
+        if (sphericalHidden(pc) || !sampleGrayGradient(spherical_gray, cam->world2cam(pc), current[j], image_derivative))
         { visible = false; break; }
         MD(2, 3) projection;
         computeProjectionJacobian(pc, projection);
@@ -503,7 +509,9 @@ void VIOManager::prepareSphericalFrame(const cv::Mat &image, const vector<pointW
     else if (information_selection)
     {
       const V3D displaced = 0.05 * weak_camera;
-      if ((point_camera + displaced).z() <= 0.0 || (point_camera - displaced).z() <= 0.0) continue;
+      if (wide_cam ? (!wide_cam->inCone(point_camera + displaced, 0.0) ||
+                      !wide_cam->inCone(point_camera - displaced, 0.0))
+                   : ((point_camera + displaced).z() <= 0.0 || (point_camera - displaced).z() <= 0.0)) continue;
       const V3D plus = point_camera + displaced;
       const V3D minus = point_camera - displaced;
       const V2D pixel_derivative = (cam->world2cam(plus) - cam->world2cam(minus)) / 0.1;
@@ -627,7 +635,7 @@ void VIOManager::linearizeSpherical(MD(6, 6) &information, MD(6, 1) &gradient,
         const V3D point = current_Rcw * world[j] + current_Pcw;
         float value;
         V2D unused_derivative;
-        const bool sampled = point.z() > .2 && (spherical_shared_brightness_en
+        const bool sampled = sphericalVisible(point) && (spherical_shared_brightness_en
               ? sampleGrayGradient(current_image,cam->world2cam(point)/scale,value,unused_derivative)
               : sampleGray(current_image,cam->world2cam(point)/scale,value));
         if (!sampled)
@@ -758,7 +766,7 @@ void VIOManager::linearizeSpherical(MD(6, 6) &information, MD(6, 1) &gradient,
     for (size_t j = 0; j < count; ++j)
     {
       camera_points[j] = current_Rcw * world_samples[j] + current_Pcw;
-      if (camera_points[j].z() <= 0.2 ||
+      if (sphericalHidden(camera_points[j]) ||
           !sampleGrayGradient(current_image, cam->world2cam(camera_points[j]) / scale,
                               current[j], gradients[j]))
       {
@@ -994,7 +1002,7 @@ bool VIOManager::evaluateSphericalCost(const StatesGroup &pose,
       float value;
       // No ZNCC/MSE re-gating or brightness refit during a trial. Every
       // original sample must remain visible; leaving the image rejects it.
-      if (projected.z() <= 0.2 ||
+      if (sphericalHidden(projected) ||
           !sampleGray(spherical_pyramid[fixed.level], cam->world2cam(projected) / scale, value)) return false;
       const double weight = fixed.sample_weights.empty() ? fixed.weight : fixed.sample_weights[j];
       double effective_gain = gain, effective_bias = bias;
@@ -1041,7 +1049,7 @@ void VIOManager::insertSphericalMapPoints(const vector<pointWithVar> &points, in
     const VOXEL_LOCATION key = sphericalVoxelKey(point.point_w);
     if (!visited.insert(key).second || spherical_map->voxels.count(key)) continue;
     const V3D camera_point = new_frame_->w2f(point.point_w);
-    if (camera_point.z() <= 0.2) continue;
+    if (sphericalHidden(camera_point)) continue;
     const V2D pixel = cam->world2cam(camera_point);
     if (!cam->isInFrame(pixel.cast<int>(), 8)) continue;
     float intensity;
@@ -1079,6 +1087,14 @@ void VIOManager::insertSphericalMapPoints(const vector<pointWithVar> &points, in
     const V2D center_pixel = cam->world2cam(center_camera);
     const V3D bearing = cam->cam2world(center_pixel);
     V3D horizontal = V3D::UnitX() - bearing.x() * bearing;
+    if (wide_cam)
+    {
+      // Beyond 180 degrees a bearing can lie along the camera X axis. Use the
+      // axis least aligned with it so the tangent basis never degenerates.
+      int axis = 0;
+      bearing.cwiseAbs().minCoeff(&axis);
+      horizontal = V3D::Unit(axis) - bearing[axis] * bearing;
+    }
     if (horizontal.squaredNorm() < 1e-6) continue;
     horizontal.normalize();
     const V3D vertical = bearing.cross(horizontal).normalized();
@@ -1121,7 +1137,8 @@ void VIOManager::insertSphericalMapPoints(const vector<pointWithVar> &points, in
           patch->range_variance.push_back(variance);
         }
         float intensity;
-        if (!sampleGray(spherical_gray, cam->world2cam(surface_camera), intensity))
+        if ((wide_cam && !wide_cam->inCone(surface_camera, 0.0)) ||
+            !sampleGray(spherical_gray, cam->world2cam(surface_camera), intensity))
         {
           valid = false;
           break;
@@ -1152,6 +1169,7 @@ void VIOManager::insertSphericalMapPoints(const vector<pointWithVar> &points, in
         const V3D surface_camera = distance * ray;
         float intensity;
         if (distance <= 0.0 || !std::isfinite(distance) ||
+            (wide_cam && !wide_cam->inCone(surface_camera, 0.0)) ||
             !sampleGray(spherical_pyramid[level], cam->world2cam(surface_camera) / scale, intensity))
         { coarse_valid = false; break; }
         world_samples.push_back(new_frame_->f2w(surface_camera));
@@ -1266,7 +1284,7 @@ int VIOManager::refreshSphericalReferences(int budget, double min_zncc)
     for (size_t k = 0; k < count; ++k)
     {
       const V3D pc = new_frame_->w2f(patch.patch_world[k]);
-      if (pc.z() <= 0.2 || !sampleGray(spherical_gray, cam->world2cam(pc), values[k]))
+      if (sphericalHidden(pc) || !sampleGray(spherical_gray, cam->world2cam(pc), values[k]))
       { visible = false; break; }
       const double r = patch.intensity[k];
       sc += values[k]; sr += r; scc += values[k]*values[k];
@@ -1295,7 +1313,7 @@ int VIOManager::refreshSphericalReferences(int budget, double min_zncc)
       for (size_t k = 0; k < patch.coarse_world[level].size(); ++k)
       {
         const V3D pc = new_frame_->w2f(patch.coarse_world[level][k]);
-        if (pc.z() <= 0.2 || !sampleGray(spherical_pyramid[level + 1], cam->world2cam(pc)/scale, coarse[level][k]))
+        if (sphericalHidden(pc) || !sampleGray(spherical_pyramid[level + 1], cam->world2cam(pc)/scale, coarse[level][k]))
         { visible = false; break; }
       }
     }
