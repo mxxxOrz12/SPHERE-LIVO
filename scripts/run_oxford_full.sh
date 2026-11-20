@@ -7,15 +7,12 @@ repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 : "${BAG_PATH:?Set BAG_PATH to your Oxford Spires ROS1 bag}"
 bag="$BAG_PATH"
 output="${OUTPUT_DIR:-$repo/results/observatory-quarter-01}"
+# Usage: run_oxford_full.sh [name] [rate] [duration|full] [ablation]
+# The ablation is "none" or a file name in config/ablation without extension.
 name=${1:-oxford_spherical_full}
 rate=${2:-0.2}
-spherical_patch=${3:-true}
-map_max_points=${4:-60000}
-per_patch_affine=${5:-true}
-duration=${6:-full}
-max_active_cameras=${7:-2}
-total_patch_budget=${8:-120}
-min_zncc=${9:-0.8}
+duration=${3:-full}
+ablation=${4:-none}
 result="$repo/Log/result/$name.txt"
 timing="$repo/Log/result/${name}_timing.csv"
 output_result="$output/trajectories/$name.txt"
@@ -67,12 +64,8 @@ for _ in {1..30}; do
   sleep 1
 done
 cd "$repo"
-roslaunch fast_livo mapping_oxford_spires.launch \
-  spherical_patch:="$spherical_patch" map_sliding_en:=true half_map_size:=60 \
-  spherical_map_max_points:="$map_max_points" spherical_affine:="$per_patch_affine" \
-  max_active_cameras:="$max_active_cameras" total_patch_budget:="$total_patch_budget" \
-  spherical_min_zncc:="$min_zncc" \
-  seq_name:="$name" \
+roslaunch fast_livo mapping_sphere_oxford.launch \
+  ablation:="$ablation" seq_name:="$name" \
   > "$output/logs/${name}_mapper.log" 2>&1 &
 mapper_pid=$!
 for _ in {1..30}; do

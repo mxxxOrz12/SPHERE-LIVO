@@ -1,0 +1,3 @@
+# Ablation of contribution 2: no brightness model (identity gain and bias).
+innovations:
+  spherical_shared_brightness: false

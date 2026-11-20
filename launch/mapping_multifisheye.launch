@@ -1,8 +1,14 @@
 <launch>
   <arg name="lidar_config" />
   <arg name="rig_config" />
+  <arg name="seq_name" default="sphere" />
+  <arg name="ablation" default="none" />
 
   <rosparam command="load" file="$(arg lidar_config)" />
   <rosparam command="load" file="$(arg rig_config)" />
+  <rosparam command="load" file="$(find fast_livo)/config/sphere_method.yaml" />
+  <rosparam command="load" file="$(find fast_livo)/config/ablation/$(arg ablation).yaml"
+            if="$(eval arg('ablation') != 'none')" />
+  <param name="/evo/seq_name" value="$(arg seq_name)" />
   <node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen" />
 </launch>

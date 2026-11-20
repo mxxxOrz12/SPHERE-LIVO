@@ -58,16 +58,5 @@ multi_fisheye:
     k3: 0.0
     k4: 0.0
 
-# Optional research path. Leave off for the original sequential multi-camera
-# baseline; validate a calibrated rig before enabling these options.
-innovations:
-  spherical_patch: false
-  shared_spherical_map: true
-  information_selection: true
-  joint_fixed_budget: true
-  max_active_cameras: 2
-  total_patch_budget: 120
-  map_insert_budget_per_camera: 30
-  spherical_probe_budget: 2048
-  joint_max_iterations: 3
-  spherical_map_max_points: 15000
+# Method parameters come from config/sphere_method.yaml, loaded by the
+# launch file after this rig file. Do not add an innovations block here.

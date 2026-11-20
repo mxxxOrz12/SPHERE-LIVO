@@ -1,0 +1,3 @@
+# Ablation of contribution 1: no LiDAR-plane anchoring or range uncertainty.
+innovations:
+  spherical_geometry_support: false

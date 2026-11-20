@@ -1,0 +1,5 @@
+# Per-camera sequential FAST-LIVO2 visual update on the same rig.
+innovations:
+  spherical_patch: false
+vio:
+  max_iterations: 5  # FAST-LIVO2 default for its own visual update

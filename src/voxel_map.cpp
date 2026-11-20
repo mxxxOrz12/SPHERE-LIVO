@@ -46,7 +46,6 @@ void loadVoxelConfig(ros::NodeHandle &nh, VoxelMapConfig &voxel_config)
   nh.param<vector<int>>("lio/layer_init_num", voxel_config.layer_init_num_, vector<int>{5,5,5,5,5});
   nh.param<int>("lio/max_points_num", voxel_config.max_points_num_, 50);
   nh.param<int>("lio/max_iterations", voxel_config.max_iterations_, 5);
-  nh.param<bool>("lio/metric_neighbor_search", voxel_config.metric_neighbor_search_en_, true);
 
   nh.param<bool>("local_map/map_sliding_en", voxel_config.map_sliding_en, false);
   nh.param<int>("local_map/half_map_size", voxel_config.half_map_size, 100);
@@ -684,9 +683,7 @@ void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, s
       {
         VOXEL_LOCATION near_position = position;
         // Centers and quarter lengths are in meters, not voxel-index units.
-        // Keep the old path only for explicit full-bag bug-fix ablations.
-        const V3D query = config_setting_.metric_neighbor_search_en_
-                            ? pv.point_w : V3D(loc_xyz[0], loc_xyz[1], loc_xyz[2]);
+        const V3D &query = pv.point_w;
         if (query[0] > (current_octo->voxel_center_[0] + current_octo->quater_length_)) { near_position.x = near_position.x + 1; }
         else if (query[0] < (current_octo->voxel_center_[0] - current_octo->quater_length_)) { near_position.x = near_position.x - 1; }
         if (query[1] > (current_octo->voxel_center_[1] + current_octo->quater_length_)) { near_position.y = near_position.y + 1; }

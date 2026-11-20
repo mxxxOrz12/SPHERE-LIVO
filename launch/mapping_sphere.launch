@@ -1,0 +1,15 @@
+<launch>
+  <!-- Dataset or rig sensor configuration: topics, calibration, LiDAR and IMU. -->
+  <arg name="sensor_config" />
+  <arg name="seq_name" default="sphere" />
+  <!-- none, or the name of a file in config/ablation without extension. -->
+  <arg name="ablation" default="none" />
+
+  <rosparam command="load" file="$(arg sensor_config)" />
+  <!-- The same method parameters for every dataset. -->
+  <rosparam command="load" file="$(find fast_livo)/config/sphere_method.yaml" />
+  <rosparam command="load" file="$(find fast_livo)/config/ablation/$(arg ablation).yaml"
+            if="$(eval arg('ablation') != 'none')" />
+  <param name="/evo/seq_name" value="$(arg seq_name)" />
+  <node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen" />
+</launch>

@@ -1,0 +1,3 @@
+# Ablation of contribution 1: each camera keeps its own patch map.
+innovations:
+  shared_spherical_map: false

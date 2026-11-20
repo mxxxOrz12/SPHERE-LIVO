@@ -24,22 +24,29 @@ roslaunch fast_livo mapping_multifisheye.launch \
   rig_config:=/absolute/path/to/rig.yaml
 ```
 
-This generic launch loads the supplied configuration. Enable
-`innovations/spherical_patch` explicitly for SPHERE-LIVO. For Oxford Spires,
-`mapping_sphere_oxford.launch` loads the complete current preset directly.
+The launch file loads the LiDAR and rig files, then the shared method
+configuration `config/sphere_method.yaml`. Keep method parameters out of the rig
+file; pass `ablation:=<name>` to overlay a file from `config/ablation`.
 
-## Method switches
+## Method parameters
 
-- `spherical_patch`: enables the spherical visual update.
-- `information_selection`: uses the weak LiDAR translation direction to score
-  visual candidates; disabling it uses texture-based ranking.
-- `shared_spherical_map`: allows cameras to observe common world-anchored patches.
-- `joint_fixed_budget`: accumulates selected camera observations in one visual
-  update, with configurable active-camera and patch limits.
-- `spherical_map_max_points`, `spherical_probe_budget`, `total_patch_budget`:
-  control map size, candidate probing and selected observations.
-- Brightness, geometry-support and update-guard options are set explicitly in
-  `config/sphere_oxford.yaml`; other combinations are experimental ablations.
+`config/sphere_method.yaml` is the same for every dataset:
+
+- `spherical_patch`: the spherical joint update (false: per-camera FAST-LIVO2).
+- `shared_spherical_map`, `spherical_geometry_support`,
+  `spherical_shared_brightness`, `information_selection`: one switch per
+  contribution, all true for SPHERE-LIVO and used only for ablations.
+- `spherical_min_zncc`, `max_active_cameras`, `total_patch_budget`,
+  `spherical_map_max_points`: correspondence gate, cameras and observations per
+  update, and map size.
+- `vio/img_point_cov`, `vio/patch_size`, `vio/max_iterations`: photometric noise,
+  patch size and iterations of the joint update.
+
+Everything else is fixed in `include/sphere_constants.h` or derived from these
+values: the Huber threshold is two photometric standard deviations, the
+brightness bias prior has the photometric variance, the selection shortlist is
+three candidates per budgeted observation and each camera inserts a quarter of
+the budget into the map per frame.
 
 Patch rays intersect local LiDAR planes to form surface samples. Candidate
 matching and photometric gates reject unsuitable observations. The budgets limit

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "sphere_constants.h"
 #include <Eigen/Core>
 #include <algorithm>
 #include <cmath>
@@ -23,7 +24,7 @@ inline bool sphericalPlaneRangeVariance(const Eigen::Vector3d &sample, const Eig
   if (!sample.allFinite() || !center.allFinite() || !normal.allFinite() || !unit_ray.allFinite() ||
       !plane_covariance.allFinite() || std::abs(unit_ray.norm()-1) > 1e-5) return false;
   const double denominator = normal.dot(unit_ray);
-  if (std::abs(denominator) < .15) return false;
+  if (std::abs(denominator) < sphere::kMinRayPlaneCosine) return false;
   Eigen::Matrix<double, 1, 6> derivative;
   derivative << -(sample-center).transpose()/denominator, normal.transpose()/denominator;
   variance = derivative*plane_covariance*derivative.transpose();

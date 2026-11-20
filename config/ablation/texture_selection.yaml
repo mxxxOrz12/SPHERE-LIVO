@@ -1,0 +1,3 @@
+# Ablation of contribution 3: rank observations by image texture.
+innovations:
+  information_selection: false

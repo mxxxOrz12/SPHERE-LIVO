@@ -1,0 +1,20 @@
+# SPHERE-LIVO method parameters, shared by every dataset.
+# Launch files load this file after the dataset's sensor configuration;
+# do not override these values per dataset. Fixed constants and the
+# quantities derived from these parameters are listed in
+# include/sphere_constants.h. Ablations overlay one file from config/ablation.
+innovations:
+  spherical_patch: true              # false: per-camera FAST-LIVO2 visual update
+  # One switch per contribution, all true for SPHERE-LIVO.
+  shared_spherical_map: true         # cameras observe common world-anchored patches
+  spherical_geometry_support: true   # LiDAR-plane anchoring and range uncertainty
+  spherical_shared_brightness: true  # per-camera affine brightness to a canonical scale
+  information_selection: true        # posterior log-det selection (false: texture ranking)
+  spherical_min_zncc: 0.8            # patch correspondence gate
+  max_active_cameras: 2              # cameras used by one visual update
+  total_patch_budget: 120            # observations per visual update
+  spherical_map_max_points: 15000    # shared patches kept in the map
+vio:
+  img_point_cov: 100  # photometric noise variance; also sets the Huber threshold and bias prior
+  patch_size: 8       # samples per patch side
+  max_iterations: 3   # iterations of the joint visual update

@@ -44,7 +44,6 @@ typedef struct VoxelMapConfig
   double dept_err_;
   double sigma_num_;
   bool is_pub_plane_map_;
-  bool metric_neighbor_search_en_ = true;
 
   // config of local map sliding
   double sliding_thresh;

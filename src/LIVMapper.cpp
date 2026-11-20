@@ -11,10 +11,17 @@ which is included as part of this source code package.
 */
 
 #include "LIVMapper.h"
-#include "visual_budget.h"
+#include "sphere_constants.h"
 #include "visual_update_guard.h"
 #include "spherical_information_selector.h"
 #include <numeric>
+#include <set>
+
+namespace
+{
+// Images buffered per camera and complete rig groups awaiting processing.
+constexpr size_t kImageQueueLength = 30;
+}
 
 LIVMapper::LIVMapper(ros::NodeHandle &nh)
     : extT(0, 0, 0),
@@ -61,56 +68,34 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<int>("common/lidar_en", lidar_en, 1);
   nh.param<string>("common/img_topic", img_topic, "/left_camera/image");
   nh.param<bool>("multi_fisheye/enabled", multi_fisheye_en, false);
+  // SPHERE-LIVO method parameters, shared by every dataset (config/sphere_method.yaml).
+  // Fixed constants are in include/sphere_constants.h.
   nh.param<bool>("innovations/spherical_patch", spherical_patch_en, false);
   nh.param<bool>("innovations/shared_spherical_map", shared_spherical_map_en, true);
+  nh.param<bool>("innovations/spherical_geometry_support", spherical_geometry_support_en, true);
+  nh.param<bool>("innovations/spherical_shared_brightness", spherical_brightness_en, true);
   nh.param<bool>("innovations/information_selection", information_selection_en, true);
-  nh.param<bool>("innovations/joint_fixed_budget", joint_fixed_budget_en, true);
-  nh.param<bool>("innovations/spherical_affine", spherical_affine_en, true);
-  nh.param<bool>("innovations/spherical_spatial_diversity", spherical_spatial_diversity_en, false);
-  nh.param<bool>("innovations/spherical_marginalize_affine", spherical_marginalize_affine_en, false);
-  nh.param<bool>("innovations/spherical_prefilter_zncc", spherical_prefilter_zncc_en, false);
-  nh.param<int>("innovations/spherical_pyramid_levels", spherical_pyramid_levels, 1);
-  nh.param<bool>("innovations/spherical_camera_affine", spherical_camera_affine_en, false);
-  nh.param<bool>("innovations/spherical_effective_information", spherical_effective_information_en, false);
-  nh.param<bool>("innovations/spherical_gain_only", spherical_gain_only_en, false);
-  nh.param<bool>("innovations/spherical_plane_anchor", spherical_plane_anchor_en, false);
-  nh.param<bool>("innovations/spherical_plane_refinement", spherical_plane_refinement_en, false);
-  nh.param<bool>("innovations/adaptive_camera_budget", adaptive_camera_budget_en, false);
-  nh.param<bool>("innovations/spherical_reference_refresh", spherical_reference_refresh_en, false);
-  nh.param<bool>("innovations/spherical_posterior_information", spherical_posterior_information_en, false);
-  nh.param<bool>("innovations/spherical_transactional_update", spherical_transactional_update_en, false);
-  nh.param<bool>("innovations/spherical_temporal_retrieval", spherical_temporal_retrieval_en, false);
-  nh.param<bool>("innovations/spherical_descent_guard", spherical_descent_guard_en, false);
-  nh.param<bool>("innovations/spherical_incremental_information", spherical_incremental_information_en, false);
-  nh.param<bool>("innovations/spherical_geometry_support", spherical_geometry_support_en, false);
-  nh.param<bool>("innovations/spherical_shared_brightness", spherical_shared_brightness_en, false);
-  nh.param<bool>("innovations/spherical_local_brightness", spherical_local_brightness_en, false);
-  nh.param<bool>("innovations/spherical_bounded_brightness", spherical_bounded_brightness_en, false);
-  if (spherical_bounded_brightness_en && (!spherical_shared_brightness_en || spherical_local_brightness_en))
-    throw std::runtime_error("Bounded exposure requires shared-only brightness (not hierarchical local shading)");
-  if (spherical_local_brightness_en && !spherical_shared_brightness_en)
-    throw std::runtime_error("Local shading requires shared camera brightness");
-  if (spherical_incremental_information_en && (!spherical_posterior_information_en || !information_selection_en))
-    throw std::runtime_error("Incremental selection requires posterior information selection");
-  if (spherical_geometry_support_en && (spherical_plane_refinement_en || spherical_reference_refresh_en))
-    throw std::runtime_error("Geometry support cache cannot be combined with unvalidated reference/geometry refresh");
-  if (spherical_descent_guard_en) spherical_transactional_update_en = true;
-  if (spherical_pyramid_levels < 1 || spherical_pyramid_levels > 4)
-    throw std::runtime_error("spherical_pyramid_levels must be in [1, 4]");
-  nh.param<double>("innovations/spherical_min_zncc", spherical_min_zncc, -1.0);
+  nh.param<double>("innovations/spherical_min_zncc", spherical_min_zncc, 0.8);
   nh.param<int>("innovations/max_active_cameras", max_active_cameras, 2);
-  if (spherical_shared_brightness_en && (!spherical_incremental_information_en || !spherical_descent_guard_en ||
-      spherical_gain_only_en || !spherical_affine_en || max_active_cameras > 3 || spherical_reference_refresh_en))
-    throw std::runtime_error("Shared brightness requires affine/incremental/guard mode with at most three cameras and no reference refresh");
   nh.param<int>("innovations/total_patch_budget", total_patch_budget, 120);
-  nh.param<int>("innovations/map_insert_budget_per_camera", map_insert_budget_per_camera, 30);
-  nh.param<int>("innovations/spherical_probe_budget", spherical_probe_budget, 2048);
-  nh.param<int>("innovations/joint_max_iterations", joint_max_iterations, 3);
   nh.param<int>("innovations/spherical_map_max_points", spherical_map_max_points, 15000);
-  if (spherical_patch_en && (!multi_fisheye_en || max_active_cameras < 1 ||
-      total_patch_budget < 1 || map_insert_budget_per_camera < 1 ||
-      spherical_probe_budget < 1 || joint_max_iterations < 1 || spherical_map_max_points < 1))
-    throw std::runtime_error("Invalid spherical multi-fisheye innovation configuration");
+  {
+    // Earlier experimental switches no longer exist; never ignore them silently.
+    static const std::set<std::string> supported = {
+        "spherical_patch", "shared_spherical_map", "spherical_geometry_support",
+        "spherical_shared_brightness", "information_selection", "spherical_min_zncc",
+        "max_active_cameras", "total_patch_budget", "spherical_map_max_points"};
+    XmlRpc::XmlRpcValue innovations;
+    if (nh.getParam("innovations", innovations) && innovations.getType() == XmlRpc::XmlRpcValue::TypeStruct)
+      for (auto it = innovations.begin(); it != innovations.end(); ++it)
+        if (!supported.count(it->first))
+          throw std::runtime_error("Unsupported parameter innovations/" + it->first +
+                                   "; see config/sphere_method.yaml");
+  }
+  if (spherical_patch_en && (!multi_fisheye_en || max_active_cameras < 1 || total_patch_budget < 1 ||
+      spherical_map_max_points < 1 || (spherical_brightness_en && max_active_cameras > 3)))
+    throw std::runtime_error("Invalid SPHERE-LIVO configuration: requires multi_fisheye, positive budgets "
+                             "and at most three active cameras with the brightness model");
   if (!std::isfinite(spherical_min_zncc) || spherical_min_zncc > 1.0)
     throw std::runtime_error("spherical_min_zncc must be finite and <= 1");
   if (multi_fisheye_en)
@@ -268,9 +253,10 @@ void LIVMapper::initializeComponents()
     manager->exposure_estimate_en = multi_fisheye_en ? false : exposure_estimate_en;
     manager->colmap_output_en = (i == 0) && colmap_output_en;
     manager->initializeVIO();
-    manager->camera_id = static_cast<int>(i);
-    manager->spherical_plane_anchor_en = spherical_plane_anchor_en;
     manager->spherical_map->max_points = static_cast<size_t>(spherical_map_max_points);
+    manager->spherical_geometry_support_en = spherical_geometry_support_en;
+    manager->spherical_brightness_en = spherical_brightness_en;
+    manager->spherical_min_zncc = spherical_min_zncc;
     if (i > 0 && spherical_patch_en && shared_spherical_map_en)
       manager->spherical_map = camera_vios[0]->spherical_map;
   }
@@ -319,7 +305,7 @@ void LIVMapper::initializeFiles()
   if (multi_fisheye_en)
   {
     fout_vio_timing.open(std::string(ROOT_DIR) + "Log/result/" + seq_name + "_timing.csv", std::ios::out);
-    fout_vio_timing << "timestamp,mode,cameras,selected_patches,vio_ms,map_points,active_ids,lidar_weak_ratio,camera_scores,accepted_patches,camera_quotas,refreshed_patches,temporal_selected_patches,guard_accepted_steps,guard_rejected_steps,guard_backtracks,guard_initial_cost,guard_final_cost,guard_status,incremental_pool_size,unique_world_patches,geometry_fine_rejections,geometry_coarse_rejections,brightness_gains,brightness_biases,brightness_fit_rejections,brightness_bound_fits\n";
+    fout_vio_timing << "timestamp,mode,cameras,selected_patches,vio_ms,map_points,active_ids,lidar_weak_ratio,accepted_patches,camera_quotas,temporal_selected_patches,guard_accepted_steps,guard_rejected_steps,guard_backtracks,guard_initial_cost,guard_final_cost,guard_status,incremental_pool_size,geometry_rejections,brightness_gains,brightness_biases,brightness_fit_rejections,brightness_bound_fits\n";
   }
 }
 
@@ -335,11 +321,11 @@ void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_tr
     {
       if (compressed_images)
         camera_subscribers.push_back(nh.subscribe<sensor_msgs::CompressedImage>(
-            camera_topics[i], 30,
+            camera_topics[i], kImageQueueLength,
             [this, i](const sensor_msgs::CompressedImageConstPtr &msg) { compressed_img_cbk(msg, i); }));
       else
         camera_subscribers.push_back(nh.subscribe<sensor_msgs::Image>(
-            camera_topics[i], 30,
+            camera_topics[i], kImageQueueLength,
             [this, i](const sensor_msgs::ImageConstPtr &msg) { img_cbk(msg, i); }));
     }
   }
@@ -499,14 +485,14 @@ void LIVMapper::handleVIO()
                     << active_cameras << ',' << selected_patches << ','
                     << vio_elapsed_ms << ',' << map_points << ','
                     << active_ids << ','
-                    << last_lidar_weak_ratio << ',' << last_camera_scores << ','
+                    << last_lidar_weak_ratio << ','
                     << last_accepted_spherical_patches << ',' << last_camera_quotas << ','
-                    << last_refreshed_spherical_patches << ',' << last_temporal_selected_spherical_patches << ','
+                    << last_temporal_selected_spherical_patches << ','
                     << last_visual_guard_accepted_steps << ',' << last_visual_guard_rejected_steps << ','
                     << last_visual_guard_backtracks << ',' << std::setprecision(12) << last_visual_guard_initial_cost << ','
                     << last_visual_guard_final_cost << ',' << last_visual_guard_status << ','
-                    << last_incremental_pool_size << ',' << last_unique_world_patches << ','
-                    << last_geometry_fine_rejections << ',' << last_geometry_coarse_rejections << ','
+                    << last_incremental_pool_size << ','
+                    << last_geometry_rejections << ','
                     << last_spherical_brightness_gains << ',' << last_spherical_brightness_biases << ','
                     << last_brightness_fit_rejections << ',' << last_brightness_bound_fits << '\n';
   }
@@ -1107,9 +1093,7 @@ void LIVMapper::runSphericalVIO(const std::vector<cv::Mat> &images)
   last_accepted_spherical_patches = 0;
   last_active_spherical_cameras = 0;
   last_active_camera_ids.clear();
-  last_camera_scores.clear();
   last_camera_quotas.clear();
-  last_refreshed_spherical_patches = 0;
   last_temporal_selected_spherical_patches = 0;
   last_lidar_weak_ratio = -1.0;
   last_visual_guard_accepted_steps = 0;
@@ -1117,54 +1101,31 @@ void LIVMapper::runSphericalVIO(const std::vector<cv::Mat> &images)
   last_visual_guard_backtracks = 0;
   last_visual_guard_initial_cost = -1.0;
   last_visual_guard_final_cost = -1.0;
-  last_visual_guard_status = spherical_descent_guard_en ? "prior_kept" : "disabled";
+  last_visual_guard_status = "prior_kept";
   last_incremental_pool_size = 0;
-  last_unique_world_patches = 0;
-  last_geometry_fine_rejections = 0;
-  last_geometry_coarse_rejections = 0;
+  last_geometry_rejections = 0;
   last_brightness_fit_rejections = 0;
   last_brightness_bound_fits = 0;
-  // The smallest eigenvector of LiDAR's weighted translational Hessian is
-  // the direction along which this scan provides the least information.
-  V3D weak_world = V3D::UnitX();
+  // Diagnostic only: weakest over strongest eigenvalue of the LiDAR
+  // translational information. Selection uses the full posterior instead.
   const M3D lidar_info = 0.5 * (voxelmap_manager->last_lidar_translation_information_ +
                                 voxelmap_manager->last_lidar_translation_information_.transpose());
   Eigen::SelfAdjointEigenSolver<M3D> lidar_eigensystem(lidar_info);
   if (lidar_eigensystem.info() == Eigen::Success &&
       lidar_eigensystem.eigenvalues().allFinite() &&
       lidar_eigensystem.eigenvalues()[2] > 1e-8)
-  {
-    weak_world = lidar_eigensystem.eigenvectors().col(0);
-    last_lidar_weak_ratio = lidar_eigensystem.eigenvalues()[0] /
-                            lidar_eigensystem.eigenvalues()[2];
-  }
-  else
-  {
-    Eigen::SelfAdjointEigenSolver<M3D> covariance_eigensystem(_state.cov.block<3, 3>(3, 3));
-    if (covariance_eigensystem.info() == Eigen::Success)
-      weak_world = covariance_eigensystem.eigenvectors().col(2);
-  }
+    last_lidar_weak_ratio = lidar_eigensystem.eigenvalues()[0] / lidar_eigensystem.eigenvalues()[2];
 
-  if (spherical_plane_refinement_en)
-  {
-    if (shared_spherical_map_en)
-      camera_vios[0]->refineSphericalGeometry(_pv_list, spherical_probe_budget);
-    else
-      for (const auto &manager : camera_vios)
-        manager->refineSphericalGeometry(_pv_list, spherical_probe_budget);
-  }
+  // The previous rig selection is re-probed first in every camera.
   std::vector<std::shared_ptr<SphericalPatchPoint>> temporal_seeds;
   std::unordered_set<const SphericalPatchPoint *> temporal_seed_ids;
-  if (spherical_temporal_retrieval_en)
-  {
-    for (const auto &manager : camera_vios)
-      for (const auto &observation : manager->spherical_selected)
-        if (temporal_seed_ids.insert(observation.point.get()).second)
-          temporal_seeds.push_back(observation.point);
-  }
+  for (const auto &manager : camera_vios)
+    for (const auto &observation : manager->spherical_selected)
+      if (temporal_seed_ids.insert(observation.point.get()).second)
+        temporal_seeds.push_back(observation.point);
+  // Pose posterior after the LiDAR update, as L*L^T = P_pose/photometric_variance.
   MD(6, 6) posterior_factor = MD(6, 6)::Zero();
   bool posterior_factor_valid = false;
-  if (spherical_posterior_information_en)
   {
     const MD(6, 6) covariance = _state.cov.block<6, 6>(0, 0);
     Eigen::LLT<MD(6, 6)> factor(0.5 * (covariance + covariance.transpose()).eval() / IMG_POINT_COV);
@@ -1175,144 +1136,97 @@ void LIVMapper::runSphericalVIO(const std::vector<cv::Mat> &images)
     }
   }
   for (const auto &manager : camera_vios)
-  {
-    manager->spherical_geometry_support_en = spherical_geometry_support_en;
-    manager->spherical_shared_brightness_en = spherical_shared_brightness_en;
-    manager->spherical_local_brightness_en = spherical_local_brightness_en;
-    manager->spherical_bounded_brightness_en = spherical_bounded_brightness_en;
     manager->spherical_plane_associations = &voxelmap_manager->ptpl_list_;
-  }
+  const size_t budget = static_cast<size_t>(total_patch_budget);
   for (size_t i = 0; i < camera_vios.size(); ++i)
-    camera_vios[i]->prepareSphericalFrame(images[i], _pv_list, weak_world,
-                                           information_selection_en, spherical_probe_budget,
-                                           spherical_prefilter_zncc_en ? spherical_min_zncc : -1.0,
-                                           spherical_pyramid_levels, spherical_effective_information_en,
-                                           spherical_gain_only_en,
+    camera_vios[i]->prepareSphericalFrame(images[i], _pv_list, information_selection_en,
                                            posterior_factor_valid ? &posterior_factor : nullptr,
-                                           spherical_temporal_retrieval_en ? &temporal_seeds : nullptr);
+                                           temporal_seeds, budget);
 
-  std::vector<size_t> order(camera_vios.size());
-  std::iota(order.begin(), order.end(), 0);
-  auto camera_score = [this](size_t i)
+  // Select at most `budget` observations from all cameras, at most one per
+  // shared world patch and from at most `max_active_cameras` cameras.
+  std::vector<int> camera_quotas(camera_vios.size(), 0);
+  if (information_selection_en && posterior_factor_valid)
   {
-    const auto &candidates = camera_vios[i]->spherical_candidates;
-    const size_t count = std::min<size_t>(16, candidates.size());
-    double score = 0.0;
-    for (size_t j = 0; j < count; ++j) score += candidates[j].score;
-    return score;
-  };
-  std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return camera_score(a) > camera_score(b); });
-  std::ostringstream scores;
-  for (size_t i = 0; i < camera_vios.size(); ++i)
-  {
-    if (i) scores << ';';
-    scores << camera_score(i);
-  }
-  last_camera_scores = scores.str();
-  std::vector<size_t> active;
-  for (size_t index : order)
-  {
-    if (camera_vios[index]->spherical_candidates.empty()) continue;
-    active.push_back(index);
-    if (active.size() >= static_cast<size_t>(max_active_cameras)) break;
-  }
-  if (spherical_incremental_information_en && posterior_factor_valid)
-  {
+    // Greedy log-det selection over a bounded shortlist: three candidates
+    // per budgeted patch, split evenly across cameras.
+    const size_t pool_limit = 3 * budget;
+    const size_t per_camera = std::max<size_t>(1, pool_limit / camera_vios.size());
     std::vector<SphericalInformationCandidate> pool;
     std::vector<std::pair<size_t, size_t>> observation_ids;
-    const size_t per_camera = std::max<size_t>(1, 360/camera_vios.size());
-    for (size_t index : order)
+    for (size_t index = 0; index < camera_vios.size(); ++index)
     {
       const auto &candidates = camera_vios[index]->spherical_candidates;
-      for (size_t j = 0; j < std::min(per_camera, candidates.size()) && pool.size() < 360; ++j)
+      for (size_t j = 0; j < std::min(per_camera, candidates.size()) && pool.size() < pool_limit; ++j)
       {
         pool.push_back({candidates[j].posterior_information, index,
                        reinterpret_cast<std::uintptr_t>(candidates[j].point.get()),
-                       candidates[j].brightness_coupling,candidates[j].brightness_information});
+                       candidates[j].brightness_coupling, candidates[j].brightness_information});
         observation_ids.emplace_back(index, j);
       }
     }
     last_incremental_pool_size = static_cast<int>(pool.size());
-    const auto selected = selectSphericalInformation(pool, total_patch_budget, max_active_cameras);
-    std::vector<int> camera_quotas(camera_vios.size(), 0);
-    for (size_t id : selected)
+    for (size_t id : selectSphericalInformation(pool, budget, max_active_cameras))
     {
       const auto &location = observation_ids[id];
-      camera_vios[location.first]->spherical_selected.push_back(camera_vios[location.first]->spherical_candidates[location.second]);
+      camera_vios[location.first]->spherical_selected.push_back(
+          camera_vios[location.first]->spherical_candidates[location.second]);
       ++camera_quotas[location.first];
     }
-    active.clear();
-    std::ostringstream quota_log;
-    for (size_t i = 0; i < camera_quotas.size(); ++i)
-    {
-      if (i) quota_log << ';';
-      quota_log << camera_quotas[i];
-      if (camera_quotas[i]) active.push_back(i);
-    }
-    last_camera_quotas = quota_log.str();
   }
-  else if (!active.empty())
+  else
   {
-    std::vector<int> quotas(active.size(), 0);
-    if (adaptive_camera_budget_en)
+    // Ablation baseline (and fallback): rank candidates by image texture.
+    std::vector<std::pair<size_t, size_t>> ranked;
+    for (size_t index = 0; index < camera_vios.size(); ++index)
+      for (size_t j = 0; j < camera_vios[index]->spherical_candidates.size(); ++j)
+        ranked.emplace_back(index, j);
+    std::stable_sort(ranked.begin(), ranked.end(),
+                     [this](const std::pair<size_t, size_t> &a, const std::pair<size_t, size_t> &b)
+                     {
+                       return camera_vios[a.first]->spherical_candidates[a.second].score >
+                              camera_vios[b.first]->spherical_candidates[b.second].score;
+                     });
+    std::unordered_set<const SphericalPatchPoint *> used;
+    size_t selected = 0, active_count = 0;
+    for (const auto &location : ranked)
     {
-      std::vector<double> strengths;
-      std::vector<int> capacities;
-      for (size_t index : active)
-      {
-        strengths.push_back(camera_score(index));
-        capacities.push_back(static_cast<int>(camera_vios[index]->spherical_candidates.size()));
-      }
-      quotas = allocateVisualBudget(strengths, capacities, total_patch_budget);
+      if (selected >= budget) break;
+      const auto &candidate = camera_vios[location.first]->spherical_candidates[location.second];
+      const bool new_camera = camera_quotas[location.first] == 0;
+      if (new_camera && active_count >= static_cast<size_t>(max_active_cameras)) continue;
+      if (!used.insert(candidate.point.get()).second) continue;
+      camera_vios[location.first]->spherical_selected.push_back(candidate);
+      ++camera_quotas[location.first];
+      ++selected;
+      if (new_camera) ++active_count;
     }
-    else
-    {
-      int remaining = total_patch_budget;
-      for (size_t i = 0; i < active.size(); ++i)
-      {
-        const int budget = remaining / static_cast<int>(active.size() - i);
-        quotas[i] = std::min<int>(budget, camera_vios[active[i]]->spherical_candidates.size());
-        remaining -= quotas[i];
-      }
-    }
-    std::vector<int> camera_quotas(camera_vios.size(), 0);
-    for (size_t i = 0; i < active.size(); ++i)
-    {
-      camera_vios[active[i]]->selectSphericalObservations(quotas[i], spherical_spatial_diversity_en);
-      camera_quotas[active[i]] = quotas[i];
-    }
-    std::ostringstream quota_log;
-    for (size_t i = 0; i < camera_quotas.size(); ++i)
-    {
-      if (i) quota_log << ';';
-      quota_log << camera_quotas[i];
-    }
-    last_camera_quotas = quota_log.str();
   }
-  last_active_spherical_cameras = static_cast<int>(active.size());
-  std::ostringstream active_ids;
-  for (size_t i = 0; i < active.size(); ++i)
+  std::vector<size_t> active;
+  std::ostringstream quota_log, active_ids;
+  for (size_t i = 0; i < camera_quotas.size(); ++i)
   {
-    if (i) active_ids << ';';
-    active_ids << active[i];
+    if (i) quota_log << ';';
+    quota_log << camera_quotas[i];
+    if (!camera_quotas[i]) continue;
+    if (!active.empty()) active_ids << ';';
+    active_ids << i;
+    active.push_back(i);
   }
+  last_camera_quotas = quota_log.str();
   last_active_camera_ids = active_ids.str();
+  last_active_spherical_cameras = static_cast<int>(active.size());
   for (size_t index : active)
+  {
     last_selected_spherical_patches += static_cast<int>(camera_vios[index]->spherical_selected.size());
-  for (size_t index : active)
     for (const auto &observation : camera_vios[index]->spherical_selected)
       if (temporal_seed_ids.count(observation.point.get())) ++last_temporal_selected_spherical_patches;
-  // Two cameras can observe the same world patch. Keep both residuals, but
-  // split their weight to avoid counting shared reference noise twice.
-  std::unordered_map<const SphericalPatchPoint *, int> multiplicity;
-  for (size_t index : active)
-    for (const auto &observation : camera_vios[index]->spherical_selected)
-      ++multiplicity[observation.point.get()];
-  last_unique_world_patches = static_cast<int>(multiplicity.size());
-  for (size_t index : active)
-    for (auto &observation : camera_vios[index]->spherical_selected)
-      observation.weight = 1.0 / multiplicity[observation.point.get()];
+  }
 
+  // One joint, guarded and transactional visual update for all selected
+  // cameras: a step is kept only if it decreases the fixed-support cost, and
+  // the whole update (mean and covariance) is rejected if the final cost or
+  // support check fails.
   auto update_from_cameras = [this](const std::vector<size_t> &indices)
   {
     if (indices.empty()) return;
@@ -1321,7 +1235,6 @@ void LIVMapper::runSphericalVIO(const std::vector<cv::Mat> &images)
     MD(6, 6) visual_information = MD(6, 6)::Zero();
     MD(6, 1) visual_gradient = MD(6, 1)::Zero();
     int accepted_patches = 0;
-    MD(6, 6) posterior_visual_information = MD(6, 6)::Zero();
     bool have_visual_update = false;
     std::vector<std::vector<SphericalCostPatch>> transaction_support(indices.size());
     auto fixed_cost = [&](StatesGroup pose, const std::vector<std::vector<SphericalCostPatch>> &support,
@@ -1335,35 +1248,28 @@ void LIVMapper::runSphericalVIO(const std::vector<cv::Mat> &images)
       objective += visual_cost / IMG_POINT_COV;
       return std::isfinite(objective);
     };
-    if (spherical_descent_guard_en)
     {
-      // Also freeze a finest-level set at the LIO prior. Final acceptance on
-      // this original set prevents gradual support loss across iterations.
+      // Freeze a support set at the LIO prior. Final acceptance on this
+      // original set prevents gradual support loss across iterations.
       MD(6, 6) unused_information = MD(6, 6)::Zero();
       MD(6, 1) unused_gradient = MD(6, 1)::Zero();
       double unused_cost = 0.0;
       int support_count = 0;
       for (size_t j = 0; j < indices.size(); ++j)
         camera_vios[indices[j]]->linearizeSpherical(unused_information, unused_gradient, unused_cost,
-            support_count, spherical_affine_en, spherical_min_zncc, spherical_marginalize_affine_en,
-            0, spherical_camera_affine_en, spherical_gain_only_en, &transaction_support[j]);
-      if (spherical_shared_brightness_en)
+                                                    support_count, &transaction_support[j]);
+      if (spherical_brightness_en)
         for (size_t j = 0; j < indices.size(); ++j)
           for (auto &sample : transaction_support[j])
           {
             sample.gain = camera_vios[indices[j]]->spherical_brightness_prior_gain;
             sample.bias = camera_vios[indices[j]]->spherical_brightness_prior_bias;
-            sample.global_gain = sample.gain;
-            sample.global_bias = sample.bias;
-            sample.local_brightness.setZero();
           }
-      if (support_count < 5 || !fixed_cost(prior_state, transaction_support, last_visual_guard_initial_cost))
+      if (support_count < sphere::kMinSupportPatches ||
+          !fixed_cost(prior_state, transaction_support, last_visual_guard_initial_cost))
       { last_visual_guard_status = "initial_support_rejected"; return; }
     }
-    // Re-use the same LIO prior at all scales. Coarse levels provide an
-    // initialization, not independent measurements added to the covariance.
-    for (int level = spherical_pyramid_levels - 1; level >= 0; --level)
-    for (int iteration = 0; iteration < joint_max_iterations; ++iteration)
+    for (int iteration = 0; iteration < max_iterations; ++iteration)
     {
       visual_information.setZero();
       visual_gradient.setZero();
@@ -1372,25 +1278,20 @@ void LIVMapper::runSphericalVIO(const std::vector<cv::Mat> &images)
       std::vector<std::vector<SphericalCostPatch>> iteration_support(indices.size());
       for (size_t j = 0; j < indices.size(); ++j)
         camera_vios[indices[j]]->linearizeSpherical(visual_information, visual_gradient,
-                                                cost, accepted_patches, spherical_affine_en,
-                                                spherical_min_zncc, spherical_marginalize_affine_en, level,
-                                                spherical_camera_affine_en, spherical_gain_only_en,
-                                                spherical_descent_guard_en ? &iteration_support[j] : nullptr);
+                                                    cost, accepted_patches, &iteration_support[j]);
       last_accepted_spherical_patches = accepted_patches;
-      if (accepted_patches < 5)
+      if (accepted_patches < sphere::kMinSupportPatches)
       {
-        if (spherical_transactional_update_en && have_visual_update)
+        if (have_visual_update)
         {
           // A partially applied mean with the old covariance is not a valid
           // posterior. Reject the complete visual transaction, not just its
           // final iteration, when the linearization loses support.
           _state = prior_state;
-          if (spherical_descent_guard_en) last_visual_guard_status = "support_rejected";
+          last_visual_guard_status = "support_rejected";
           ROS_WARN_THROTTLE(5.0, "Spherical visual transaction rejected: insufficient support");
-          return;
         }
-        if (spherical_pyramid_levels == 1) return;
-        break;
+        return;
       }
       MD(DIM_STATE, DIM_STATE) system = prior_information;
       system.block<6, 6>(0, 0) += visual_information / IMG_POINT_COV;
@@ -1400,23 +1301,22 @@ void LIVMapper::runSphericalVIO(const std::vector<cv::Mat> &images)
       MD(DIM_STATE, 1) increment = -system.ldlt().solve(rhs);
       if (!increment.allFinite())
       {
-        if (spherical_transactional_update_en) _state = prior_state;
+        _state = prior_state;
         return;
       }
       const double angle = increment.block<3, 1>(0, 0).norm();
       const double translation = increment.block<3, 1>(3, 0).norm();
-      const double damping = std::min(1.0, std::min(0.03 / std::max(angle, 1e-12),
-                                                   0.08 / std::max(translation, 1e-12)));
+      const double damping = std::min(1.0, std::min(sphere::kMaxStepRotation / std::max(angle, 1e-12),
+                                                   sphere::kMaxStepTranslation / std::max(translation, 1e-12)));
       increment *= damping;
       double accepted_step = 1.0;
-      if (spherical_descent_guard_en)
       {
         const StatesGroup before_state = _state;
         double before_cost = 0.0;
         const double predicted_half_decrease = -rhs.dot(increment);
         bool accepted = false;
         if (fixed_cost(before_state, iteration_support, before_cost))
-        for (int trial_index = 0; trial_index < 6; ++trial_index)
+        for (int trial_index = 0; trial_index < sphere::kMaxBacktracks; ++trial_index)
         {
           accepted_step = std::ldexp(1.0, -trial_index);
           StatesGroup trial_state = before_state;
@@ -1442,14 +1342,12 @@ void LIVMapper::runSphericalVIO(const std::vector<cv::Mat> &images)
           break;
         }
       }
-      else _state += increment;
-      posterior_visual_information = visual_information;
       have_visual_update = true;
       if (angle * damping * accepted_step < 1e-4 && translation * damping * accepted_step < 1e-4) break;
     }
     if (!have_visual_update)
     {
-      if (spherical_shared_brightness_en && fixed_cost(_state,transaction_support,last_visual_guard_final_cost,true) &&
+      if (spherical_brightness_en && fixed_cost(_state,transaction_support,last_visual_guard_final_cost,true) &&
           last_visual_guard_final_cost < last_visual_guard_initial_cost)
       {
         for (size_t index : indices)
@@ -1461,53 +1359,39 @@ void LIVMapper::runSphericalVIO(const std::vector<cv::Mat> &images)
       }
       return;
     }
-    if (spherical_transactional_update_en)
+    // Form the reported covariance at the committed pose, rather than at
+    // the previous iterate. Use the same prior once, not once per step.
+    MD(6, 6) posterior_visual_information = MD(6, 6)::Zero();
+    visual_gradient.setZero();
+    double final_cost = 0;
+    accepted_patches = 0;
+    for (size_t index : indices)
+      camera_vios[index]->linearizeSpherical(posterior_visual_information, visual_gradient,
+                                             final_cost, accepted_patches);
+    last_accepted_spherical_patches = accepted_patches;
+    if (accepted_patches < sphere::kMinSupportPatches || !posterior_visual_information.allFinite())
     {
-      // Form the reported covariance at the committed pose, rather than at
-      // the previous iterate. Use the same prior once, not once per step.
-      posterior_visual_information.setZero();
-      visual_gradient.setZero();
-      double final_cost = 0;
-      accepted_patches = 0;
-      for (size_t index : indices)
-        camera_vios[index]->linearizeSpherical(posterior_visual_information, visual_gradient,
-                                               final_cost, accepted_patches, spherical_affine_en,
-                                               spherical_min_zncc, spherical_marginalize_affine_en, 0,
-                                               spherical_camera_affine_en, spherical_gain_only_en);
-      last_accepted_spherical_patches = accepted_patches;
-      if (accepted_patches < 5 || !posterior_visual_information.allFinite())
-      {
-        _state = prior_state;
-        if (spherical_descent_guard_en) last_visual_guard_status = "final_support_rejected";
-        return;
-      }
+      _state = prior_state;
+      last_visual_guard_status = "final_support_rejected";
+      return;
     }
     MD(DIM_STATE, DIM_STATE) system = prior_information;
     system.block<6, 6>(0, 0) += posterior_visual_information / IMG_POINT_COV;
-    if (spherical_descent_guard_en &&
-        (!fixed_cost(_state,transaction_support,last_visual_guard_final_cost,spherical_shared_brightness_en) ||
-         last_visual_guard_final_cost >= last_visual_guard_initial_cost))
+    if (!fixed_cost(_state,transaction_support,last_visual_guard_final_cost,spherical_brightness_en) ||
+        last_visual_guard_final_cost >= last_visual_guard_initial_cost)
     {
       _state = prior_state;
       last_visual_guard_status = "final_cost_rejected";
       return;
     }
-    if (spherical_transactional_update_en)
-    {
-      Eigen::LLT<MD(DIM_STATE, DIM_STATE)> factor(0.5 * (system + system.transpose()).eval());
-      if (factor.info() != Eigen::Success)
-      { _state = prior_state; return; }
-      const MD(DIM_STATE, DIM_STATE) covariance = factor.solve(MD(DIM_STATE, DIM_STATE)::Identity());
-      if (!covariance.allFinite()) { _state = prior_state; return; }
-      _state.cov = 0.5 * (covariance + covariance.transpose()).eval();
-    }
-    else
-    {
-    _state.cov = system.inverse();
-    _state.cov = 0.5 * (_state.cov + _state.cov.transpose()).eval();
-    }
-    if (spherical_descent_guard_en) last_visual_guard_status = "committed";
-    if (spherical_shared_brightness_en)
+    Eigen::LLT<MD(DIM_STATE, DIM_STATE)> factor(0.5 * (system + system.transpose()).eval());
+    if (factor.info() != Eigen::Success)
+    { _state = prior_state; return; }
+    const MD(DIM_STATE, DIM_STATE) covariance = factor.solve(MD(DIM_STATE, DIM_STATE)::Identity());
+    if (!covariance.allFinite()) { _state = prior_state; return; }
+    _state.cov = 0.5 * (covariance + covariance.transpose()).eval();
+    last_visual_guard_status = "committed";
+    if (spherical_brightness_en)
       for (size_t index : indices)
       {
         camera_vios[index]->spherical_brightness_gain = camera_vios[index]->spherical_fitted_brightness_gain;
@@ -1516,22 +1400,15 @@ void LIVMapper::runSphericalVIO(const std::vector<cv::Mat> &images)
     ROS_INFO_THROTTLE(5.0, "Spherical fusion: %d patches, %zu camera(s), budget %d",
                       accepted_patches, indices.size(), total_patch_budget);
   };
-
-  if (joint_fixed_budget_en)
-    update_from_cameras(active);
-  else
-    for (size_t index : active) update_from_cameras({index});
+  update_from_cameras(active);
 
   // All cameras contribute to the common visual map, including cameras not
   // selected for this update. The insertion cap prevents map-growth spikes.
+  const int insert_budget = std::max(1, total_patch_budget / 4);
   for (const auto &manager : camera_vios)
   {
-    if (spherical_reference_refresh_en)
-      last_refreshed_spherical_patches += manager->refreshSphericalReferences(map_insert_budget_per_camera);
-    manager->insertSphericalMapPoints(_pv_list, map_insert_budget_per_camera,
-                                      spherical_probe_budget);
-    last_geometry_fine_rejections += manager->spherical_geometry_fine_rejections;
-    last_geometry_coarse_rejections += manager->spherical_geometry_coarse_rejections;
+    manager->insertSphericalMapPoints(_pv_list, insert_budget);
+    last_geometry_rejections += manager->spherical_geometry_rejections;
     last_brightness_fit_rejections += manager->spherical_brightness_fit_rejections;
     last_brightness_bound_fits += manager->spherical_brightness_bound_fits;
   }
@@ -1572,11 +1449,12 @@ void LIVMapper::compressed_img_cbk(const sensor_msgs::CompressedImageConstPtr &m
 void LIVMapper::enqueueMultiFisheyeImage(const cv::Mat &image, double timestamp, size_t camera_id)
 {
     std::lock_guard<std::mutex> lock(mtx_buffer);
-    if (timestamp <= last_camera_timestamps[camera_id] + 0.001) return;
+    // Frames of one camera closer than the rig synchronization tolerance are duplicates.
+    if (timestamp <= last_camera_timestamps[camera_id] + camera_sync_tolerance) return;
     last_camera_timestamps[camera_id] = timestamp;
     auto &queue = camera_frame_buffers[camera_id];
     queue.push_back({timestamp, image});
-    if (queue.size() > 30)
+    if (queue.size() > kImageQueueLength)
     {
       queue.pop_front();
       ROS_WARN_THROTTLE(5.0, "Multi-fisheye image queue overflow; check camera synchronization");
@@ -1616,12 +1494,12 @@ void LIVMapper::enqueueMultiFisheyeImage(const cv::Mat &image, double timestamp,
       group_time /= camera_count;
       // Downsample complete rig groups, not independent camera streams.
       if (++camera_group_counter % (hilti_en ? 4 : camera_frame_stride) != 0) continue;
-      if (group_time <= last_timestamp_img + 0.02) continue;
+      if (group_time <= last_timestamp_img + camera_sync_tolerance) continue;
       img_buffer.push_back(group.front());
       img_group_buffer.push_back(std::move(group));
       img_time_buffer.push_back(group_time);
       last_timestamp_img = group_time;
-      if (img_group_buffer.size() > 30)
+      if (img_group_buffer.size() > kImageQueueLength)
       {
         img_buffer.pop_front();
         img_group_buffer.pop_front();

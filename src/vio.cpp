@@ -15,16 +15,16 @@ which is included as part of this source code package.
 #include "visual_update_guard.h"
 #include "spherical_geometry_support.h"
 #include "spherical_brightness_model.h"
-#include "spherical_hierarchical_brightness.h"
+#include "sphere_constants.h"
 #include <vikit/equidistant_camera.h>
 
 namespace
 {
 VOXEL_LOCATION sphericalVoxelKey(const V3D &point)
 {
-  return VOXEL_LOCATION(static_cast<int64_t>(std::floor(point.x() / 0.5)),
-                        static_cast<int64_t>(std::floor(point.y() / 0.5)),
-                        static_cast<int64_t>(std::floor(point.z() / 0.5)));
+  return VOXEL_LOCATION(static_cast<int64_t>(std::floor(point.x() / sphere::kMapVoxelSize)),
+                        static_cast<int64_t>(std::floor(point.y() / sphere::kMapVoxelSize)),
+                        static_cast<int64_t>(std::floor(point.z() / sphere::kMapVoxelSize)));
 }
 
 bool sampleGray(const cv::Mat &image, const V2D &pixel, float &value)
@@ -251,23 +251,20 @@ void VIOManager::computeProjectionJacobian(V3D p, MD(2, 3) & J)
 }
 
 void VIOManager::prepareSphericalFrame(const cv::Mat &image, const vector<pointWithVar> &points,
-                                       const V3D &weak_world, bool information_selection, int max_probes,
-                                       double candidate_min_zncc, int pyramid_levels, bool effective_information,
-                                       bool gain_only, const MD(6, 6) *posterior_factor,
-                                       const std::vector<std::shared_ptr<SphericalPatchPoint>> *temporal_seeds)
+                                       bool information_selection, const MD(6, 6) *posterior_factor,
+                                       const std::vector<std::shared_ptr<SphericalPatchPoint>> &temporal_seeds,
+                                       size_t prefit_count)
 {
   spherical_candidates.clear();
   spherical_selected.clear();
-  spherical_geometry_fine_rejections = 0;
+  spherical_geometry_rejections = 0;
   spherical_brightness_fit_rejections = 0;
   spherical_brightness_bound_fits = 0;
-  spherical_geometry_coarse_rejections = 0;
   spherical_brightness_prior_gain = spherical_brightness_gain;
   spherical_brightness_prior_bias = spherical_brightness_bias;
   spherical_fitted_brightness_gain = spherical_brightness_gain;
   spherical_fitted_brightness_bias = spherical_brightness_bias;
   if (posterior_factor) spherical_selection_factor = *posterior_factor;
-  ++spherical_frame_id;
   cv::Mat resized;
   if (image.cols != width || image.rows != height)
     cv::resize(image, resized, cv::Size(width, height), 0, 0, cv::INTER_LINEAR);
@@ -278,72 +275,53 @@ void VIOManager::prepareSphericalFrame(const cv::Mat &image, const vector<pointW
     cv::cvtColor(resized, spherical_gray, cv::COLOR_BGR2GRAY);
   else
     spherical_gray = resized;
-  spherical_pyramid.clear();
-  spherical_pyramid.push_back(spherical_gray);
-  for (int level = 1; level < pyramid_levels; ++level)
-  {
-    cv::Mat coarse;
-    cv::pyrDown(spherical_pyramid.back(), coarse);
-    spherical_pyramid.push_back(coarse);
-  }
   new_frame_.reset(new Frame(cam, spherical_gray));
   updateFrameState(*state);
 
-  if (spherical_map->voxels.empty() || (points.empty() && !temporal_seeds)) return;
+  if (spherical_map->voxels.empty()) return;
+  // Reproject the bounded previous selection in every camera first: a visible
+  // map patch need not be hit in the exact same voxel by this scan. Then
+  // probe map voxels at LiDAR points spread evenly over the scan.
   std::unordered_set<VOXEL_LOCATION> visited;
-  const size_t step = std::max<size_t>(1, (points.size() + max_probes - 1) /
-                                             static_cast<size_t>(max_probes));
-  const M3D rotation = new_frame_->T_f_w_.rotation_matrix();
-  const V3D weak_camera = rotation * weak_world;
   std::vector<std::shared_ptr<SphericalPatchPoint>> probes;
-  probes.reserve(max_probes);
-  auto append_lidar_probe = [&](size_t i)
+  probes.reserve(sphere::kProbeBudget);
+  const auto plan = makeSphericalProbePlan(temporal_seeds.size(), points.size(), sphere::kProbeBudget);
+  for (size_t i = 0; i < plan.temporal_count; ++i)
   {
-    const VOXEL_LOCATION key = sphericalVoxelKey(points[i].point_w);
-    if (!visited.insert(key).second) return;
+    const auto &point = temporal_seeds[i];
+    auto found = spherical_map->voxels.find(point->map_key);
+    if (found == spherical_map->voxels.end() || found->second.get() != point.get()) continue;
+    if (visited.insert(point->map_key).second) probes.push_back(point);
+  }
+  for (size_t j = 0; j < plan.lidar_count; ++j)
+  {
+    const VOXEL_LOCATION key =
+        sphericalVoxelKey(points[balancedSphericalProbeIndex(j, points.size(), plan.lidar_count)].point_w);
+    if (!visited.insert(key).second) continue;
     auto found = spherical_map->voxels.find(key);
     if (found != spherical_map->voxels.end()) probes.push_back(found->second);
-  };
-  if (temporal_seeds)
-  {
-    // A visible map patch need not be hit in the exact same 50 cm voxel by
-    // this scan. Reproject the bounded last-rig selection in every camera.
-    // No previous image or camera-specific image map is retained here.
-    const auto plan = makeSphericalProbePlan(temporal_seeds->size(), points.size(), max_probes);
-    for (size_t i = 0; i < plan.temporal_count; ++i)
-    {
-      const auto &point = (*temporal_seeds)[i];
-      auto found = spherical_map->voxels.find(point->map_key);
-      if (found == spherical_map->voxels.end() || found->second.get() != point.get()) continue;
-      if (visited.insert(point->map_key).second) probes.push_back(point);
-    }
-    for (size_t j = 0; j < plan.lidar_count; ++j)
-      append_lidar_probe(balancedSphericalProbeIndex(j, points.size(), plan.lidar_count));
   }
-  else
-  {
-    // Preserve the original proposal order and stride in the baseline path.
-    for (size_t i = 0; i < points.size(); i += step) append_lidar_probe(i);
-  }
+
+  const M3D rotation = new_frame_->T_f_w_.rotation_matrix();
+  const double huber = photometricHuber();
+  // Half a patch plus the bilinear and central-difference stencil.
+  const int center_border = patch_size_half + 2;
   for (const auto &patch : probes)
   {
-    if (spherical_shared_brightness_en && !patch->normalized_brightness) continue;
     const V3D point_camera = new_frame_->w2f(patch->center_w);
-    if (point_camera.z() <= 0.2) continue;
+    if (point_camera.z() <= sphere::kMinDepth) continue;
     const V2D pixel = cam->world2cam(point_camera);
-    if (!cam->isInFrame(pixel.cast<int>(), 6)) continue;
+    if (!cam->isInFrame(pixel.cast<int>(), center_border)) continue;
     float intensity;
     V2D image_gradient;
     if (!sampleGrayGradient(spherical_gray, pixel, intensity, image_gradient)) continue;
-    const double texture = image_gradient.squaredNorm();
-    if (texture < 16.0 && !(information_selection && (effective_information || posterior_factor))) continue;
 
-    // Reject invalid correspondence before spending the bounded update budget.
-    // The iterative residual still checks visibility and ZNCC at every pose.
-    if (candidate_min_zncc > -1.0)
+    // Every sample must be visible and the patch must match its reference
+    // (ZNCC is invariant to the affine brightness change between cameras).
+    // Reject invalid correspondences before spending the update budget.
+    const size_t count = patch->patch_world.size();
+    if (!count || count != patch->intensity.size()) continue;
     {
-      const size_t count = patch->patch_world.size();
-      if (count == 0 || count != patch->intensity.size()) continue;
       double current_sum = 0.0, reference_sum = 0.0;
       double current_squared = 0.0, reference_squared = 0.0, product = 0.0;
       bool visible = true;
@@ -351,7 +329,7 @@ void VIOManager::prepareSphericalFrame(const cv::Mat &image, const vector<pointW
       {
         const V3D projected = new_frame_->w2f(patch->patch_world[j]);
         float value;
-        if (projected.z() <= 0.2 || !sampleGray(spherical_gray, cam->world2cam(projected), value))
+        if (projected.z() <= sphere::kMinDepth || !sampleGray(spherical_gray, cam->world2cam(projected), value))
         {
           visible = false;
           break;
@@ -368,35 +346,26 @@ void VIOManager::prepareSphericalFrame(const cv::Mat &image, const vector<pointW
       const double current_variance = std::max(0.0, current_squared - current_sum * current_sum / count);
       const double reference_variance = std::max(0.0, reference_squared - reference_sum * reference_sum / count);
       const double zncc = covariance / std::sqrt(std::max(current_variance * reference_variance, 1e-12));
-      if (!std::isfinite(zncc) || zncc < candidate_min_zncc) continue;
+      if (!std::isfinite(zncc) || zncc < spherical_min_zncc) continue;
     }
 
-    double score = texture;
+    // Texture ranking is the ablation baseline and the fallback when the
+    // posterior covariance cannot be factored.
+    double score = image_gradient.squaredNorm();
     MD(6, 6) candidate_information = MD(6, 6)::Zero();
     if (information_selection && posterior_factor)
     {
-      // Match the conditional pose Hessian used by the legacy update, but
-      // evaluate the whole patch, including rotation/translation coupling.
-      // The supplied factor obeys L*L^T=P_pose/photometric_variance, so
-      // logdet(I+L^T H L) is dimensionless (unlike mixing radians/meters).
-      const size_t count = patch->patch_world.size();
-      if (!count || count != patch->intensity.size()) continue;
       std::vector<float> values(count);
-      std::vector<MD(1, 6)> jacobians(count);
+      std::vector<V2D> gradients(count);
+      std::vector<V3D> camera_points(count);
       double sc = 0, sr = 0, scc = 0, srr = 0, scr = 0;
       bool visible = true;
       for (size_t j = 0; j < count; ++j)
       {
-        const V3D pc = new_frame_->w2f(patch->patch_world[j]);
-        V2D derivative;
-        if (pc.z() <= 0.2 || !sampleGrayGradient(spherical_gray, cam->world2cam(pc), values[j], derivative))
+        camera_points[j] = new_frame_->w2f(patch->patch_world[j]);
+        if (camera_points[j].z() <= sphere::kMinDepth ||
+            !sampleGrayGradient(spherical_gray, cam->world2cam(camera_points[j]), values[j], gradients[j]))
         { visible = false; break; }
-        MD(2, 3) projection;
-        computeProjectionJacobian(pc, projection);
-        M3D skew; skew << SKEW_SYM_MATRX(pc);
-        const Eigen::Matrix<double, 1, 3> dp = -derivative.transpose() * projection;
-        jacobians[j] << derivative.transpose() * projection * skew * Jdphi_dR + dp * Jdp_dR,
-                        dp * rotation;
         sc += values[j]; sr += patch->intensity[j];
         scc += values[j] * values[j]; srr += patch->intensity[j] * patch->intensity[j];
         scr += values[j] * patch->intensity[j];
@@ -406,37 +375,36 @@ void VIOManager::prepareSphericalFrame(const cv::Mat &image, const vector<pointW
       const double variance = std::max(0.0, scc - sc * sc / count);
       const double reference_variance = std::max(0.0, srr - sr * sr / count);
       const double zncc = covariance / std::sqrt(std::max(variance * reference_variance, 1e-12));
-      if (!std::isfinite(zncc) || (candidate_min_zncc > -1 && zncc < candidate_min_zncc)) continue;
-      const double gain = spherical_shared_brightness_en ? spherical_brightness_prior_gain
-                            : std::max(0.5, std::min(2.0, covariance / std::max(variance, 1.0)));
-      const double bias = spherical_shared_brightness_en ? spherical_brightness_prior_bias : (sr-gain*sc)/count;
+      if (!std::isfinite(zncc) || zncc < spherical_min_zncc) continue;
+      // Pose information of the whole patch, whitened by the LiDAR-updated
+      // posterior: L*L^T = P_pose/photometric_variance, so log det(I+L^T H L)
+      // is the dimensionless information gain of this observation.
+      const double gain = spherical_brightness_prior_gain, bias = spherical_brightness_prior_bias;
       MD(6, 6) information = MD(6, 6)::Zero();
-      double patch_cost = 0;
       for (size_t j = 0; j < count; ++j)
       {
+        const V3D &pc = camera_points[j];
+        MD(2, 3) projection;
+        computeProjectionJacobian(pc, projection);
+        M3D skew; skew << SKEW_SYM_MATRX(pc);
+        const Eigen::Matrix<double, 1, 3> dp = -gradients[j].transpose() * projection;
+        MD(1, 6) jacobian;
+        jacobian << gradients[j].transpose() * projection * skew * Jdphi_dR + dp * Jdp_dR,
+                    dp * rotation;
         const double residual = gain * values[j] + bias - patch->intensity[j];
         double geometry_weight = 1.0;
         if (spherical_geometry_support_en)
         {
           if (patch->range_variance.size() != count) { visible = false; break; }
           const V3D ray = (patch->patch_world[j]-patch->geometry_origin_w).normalized();
-          const V3D pc = new_frame_->w2f(patch->patch_world[j]);
-          V2D derivative;
-          float unused_value;
-          MD(2, 3) projection;
-          if (!sampleGrayGradient(spherical_gray, cam->world2cam(pc), unused_value, derivative))
-          { visible = false; break; }
-          computeProjectionJacobian(pc, projection);
-          const double sensitivity = gain * derivative.transpose()*projection*rotation*ray;
-          const double variance = sensitivity*sensitivity*patch->range_variance[j];
-          geometry_weight = img_point_cov/(img_point_cov+variance);
+          const double sensitivity = gain * gradients[j].transpose()*projection*rotation*ray;
+          geometry_weight = img_point_cov/(img_point_cov+sensitivity*sensitivity*patch->range_variance[j]);
         }
-        const double weight = geometry_weight * std::min(1.0, 20.0 / std::max(std::abs(residual), 1e-9));
-        const MD(1, 6) h = gain * jacobians[j];
+        const double weight = geometry_weight * std::min(1.0, huber / std::max(std::abs(residual), 1e-9));
+        const MD(1, 6) h = gain * jacobian;
         information.noalias() += weight * h.transpose() * h;
-        patch_cost += residual * residual;
       }
-      if (!visible || (!spherical_shared_brightness_en && patch_cost / count > 900.0)) continue;
+      if (!visible) continue;
       const MD(6, 6) whitened = posterior_factor->transpose() * information * (*posterior_factor);
       candidate_information = .5*(whitened+whitened.transpose()).eval();
       const MD(6, 6) normalized = MD(6, 6)::Identity() + 0.5 * (whitened + whitened.transpose()).eval();
@@ -445,87 +413,18 @@ void VIOManager::prepareSphericalFrame(const cv::Mat &image, const vector<pointW
       const MD(6, 6) lower = factor.matrixL();
       score = 2.0 * lower.diagonal().array().log().sum();
     }
-    else if (information_selection && effective_information)
-    {
-      const size_t count = patch->patch_world.size();
-      if (count == 0 || count != patch->intensity.size()) continue;
-      std::vector<float> current(count);
-      std::vector<V3D> translations(count);
-      double sc = 0, sr = 0, covariance = 0, variance = 0, reference_variance = 0;
-      bool visible = true;
-      for (size_t j = 0; j < count; ++j)
-      {
-        const V3D pc = new_frame_->w2f(patch->patch_world[j]);
-        V2D image_derivative;
-        if (pc.z() <= 0.2 || !sampleGrayGradient(spherical_gray, cam->world2cam(pc), current[j], image_derivative))
-        { visible = false; break; }
-        MD(2, 3) projection;
-        computeProjectionJacobian(pc, projection);
-        translations[j] = (-image_derivative.transpose() * projection * rotation).transpose();
-        sc += current[j]; sr += patch->intensity[j];
-      }
-      if (!visible) continue;
-      const double mc = sc / count, mr = sr / count;
-      for (size_t j = 0; j < count; ++j)
-      {
-        covariance += (current[j] - mc) * (patch->intensity[j] - mr);
-        variance += (current[j] - mc) * (current[j] - mc);
-        reference_variance += (patch->intensity[j] - mr) * (patch->intensity[j] - mr);
-      }
-      const double gain_ratio = gain_only ? (covariance + count * mc * mr) /
-                                               std::max(variance + count * mc * mc, 1.0)
-                                         : covariance / std::max(variance, 1.0);
-      const double gain = std::max(0.5, std::min(2.0, gain_ratio));
-      const double bias = gain_only ? 0.0 : mr - gain * mc;
-      M3D pose_info = M3D::Zero();
-      Eigen::Matrix<double, 3, 2> coupling = Eigen::Matrix<double, 3, 2>::Zero();
-      Eigen::Matrix2d brightness_info = Eigen::Matrix2d::Zero();
-      for (size_t j = 0; j < count; ++j)
-      {
-        const double residual = gain * current[j] + bias - patch->intensity[j];
-        const double weight = std::min(1.0, 20.0 / std::max(std::abs(residual), 1e-9));
-        const V3D h = gain * translations[j];
-        const Eigen::Vector2d b(gain_only ? current[j] : current[j] - mc, gain_only ? 0.0 : 1.0);
-        pose_info.noalias() += weight * h * h.transpose();
-        coupling.noalias() += weight * h * b.transpose();
-        brightness_info.noalias() += weight * b * b.transpose();
-      }
-      brightness_info.diagonal().array() += 1e-9;
-      pose_info.noalias() -= coupling * brightness_info.ldlt().solve(coupling.transpose());
-      const double zncc = covariance / std::sqrt(std::max(variance * reference_variance, 1e-12));
-      const double reliability = std::max(0.0, std::min(1.0, zncc));
-      // Rank the information that survives brightness fitting. A linear ramp
-      // can have a large center gradient but zero effective pose information.
-      score = reliability * reliability *
-              (std::max(0.0, weak_world.dot(pose_info * weak_world)) +
-               0.01 * std::max(0.0, pose_info.trace()));
-    }
-    else if (information_selection)
-    {
-      const V3D displaced = 0.05 * weak_camera;
-      if ((point_camera + displaced).z() <= 0.0 || (point_camera - displaced).z() <= 0.0) continue;
-      const V3D plus = point_camera + displaced;
-      const V3D minus = point_camera - displaced;
-      const V2D pixel_derivative = (cam->world2cam(plus) - cam->world2cam(minus)) / 0.1;
-      const double sensitivity = image_gradient.dot(pixel_derivative);
-      score = sensitivity * sensitivity + 0.01 * texture;
-    }
-    if (std::isfinite(score) && (!effective_information || score > 1e-8))
-    {
-      const int grid_x = std::min(5, std::max(0, static_cast<int>(pixel.x() * 6.0 / width)));
-      const int grid_y = std::min(3, std::max(0, static_cast<int>(pixel.y() * 4.0 / height)));
-      spherical_candidates.push_back({patch, score, 1.0, grid_y * 6 + grid_x, candidate_information});
-    }
+    if (std::isfinite(score))
+      spherical_candidates.push_back({patch, score, candidate_information});
   }
   std::sort(spherical_candidates.begin(), spherical_candidates.end(),
             [](const SphericalObservation &a, const SphericalObservation &b) { return a.score > b.score; });
-  if (spherical_candidates.size() > static_cast<size_t>(max_probes))
-    spherical_candidates.resize(max_probes);
-  if (spherical_shared_brightness_en && posterior_factor && !spherical_candidates.empty())
+  if (spherical_candidates.size() > static_cast<size_t>(sphere::kProbeBudget))
+    spherical_candidates.resize(sphere::kProbeBudget);
+  if (spherical_brightness_en && information_selection && posterior_factor && !spherical_candidates.empty())
   {
-    // Bounded frame-level fit on the exact shortlist used by the global
-    // selector. Populate joint pose/brightness information with this model.
-    const size_t count = std::min<size_t>(120,spherical_candidates.size());
+    // Fit this camera's brightness on the shortlist the global selector will
+    // see, and score each candidate with the brightness block marginalized.
+    const size_t count = std::min(prefit_count, spherical_candidates.size());
     spherical_selected.assign(spherical_candidates.begin(),spherical_candidates.begin()+count);
     for (auto &observation : spherical_selected) observation.score = -1.0;
     spherical_cache_information = true;
@@ -533,7 +432,7 @@ void VIOManager::prepareSphericalFrame(const cv::Mat &image, const vector<pointW
     MD(6,1) gradient = MD(6,1)::Zero();
     double cost = 0;
     int valid = 0;
-    linearizeSpherical(information,gradient,cost,valid,true,candidate_min_zncc,false,0,true,false);
+    linearizeSpherical(information,gradient,cost,valid);
     spherical_cache_information = false;
     spherical_candidates.clear();
     for (const auto &observation : spherical_selected)
@@ -544,82 +443,41 @@ void VIOManager::prepareSphericalFrame(const cv::Mat &image, const vector<pointW
   }
 }
 
-void VIOManager::selectSphericalObservations(size_t budget, bool spatial_diversity)
-{
-  const size_t count = std::min(budget, spherical_candidates.size());
-  if (!spatial_diversity || count < 24)
-  {
-    spherical_selected.assign(spherical_candidates.begin(), spherical_candidates.begin() + count);
-    return;
-  }
-  spherical_selected.clear();
-  spherical_selected.reserve(count);
-  std::vector<int> cell_counts(24, 0);
-  std::unordered_set<const SphericalPatchPoint *> chosen;
-  const int cell_quota = std::max(3, static_cast<int>((count + 23) / 24) * 2);
-  for (const auto &candidate : spherical_candidates)
-  {
-    if (spherical_selected.size() == count) break;
-    if (candidate.spatial_cell < 0 || candidate.spatial_cell >= 24 ||
-        cell_counts[candidate.spatial_cell] >= cell_quota) continue;
-    spherical_selected.push_back(candidate);
-    ++cell_counts[candidate.spatial_cell];
-    chosen.insert(candidate.point.get());
-  }
-  // Preserve the fixed budget when only a few cells contain observable patches.
-  for (const auto &candidate : spherical_candidates)
-  {
-    if (spherical_selected.size() == count) break;
-    if (chosen.insert(candidate.point.get()).second)
-      spherical_selected.push_back(candidate);
-  }
-}
-
-void VIOManager::linearizeSpherical(MD(6, 6) &information, MD(6, 1) &gradient,
-                                    double &cost, int &valid_patches, bool per_patch_affine,
-                                    double min_zncc, bool marginalize_affine, int level,
-                                    bool camera_affine, bool gain_only,
-                                    std::vector<SphericalCostPatch> *fixed_support)
+void VIOManager::linearizeSpherical(MD(6, 6) &information, MD(6, 1) &gradient, double &cost,
+                                    int &valid_patches, std::vector<SphericalCostPatch> *fixed_support)
 {
   if (spherical_selected.empty()) return;
-  if (spherical_local_brightness_en) spherical_fitted_local_brightness.clear();
   const M3D Rwi = state->rot_end;
   const V3D Pwi = state->pos_end;
   const M3D current_Rcw = Rci * Rwi.transpose();
   const V3D current_Pcw = -current_Rcw * Pwi + Pci;
   const M3D J_translation = Rci * Rwi.transpose();
-  if (level < 0 || level >= static_cast<int>(spherical_pyramid.size())) return;
-  const double scale = static_cast<double>(1 << level);
-  const cv::Mat &current_image = spherical_pyramid[level];
+  const double huber = photometricHuber();
 
+  // One affine brightness (gain, bias) shared by all patches of this camera.
+  // Without the brightness model it stays at the identity prior.
   struct BrightnessGroup
   {
     std::vector<std::pair<double, double>> samples;
     std::vector<double> weights;
-    std::vector<SphericalBrightnessBlock> blocks;
-    std::vector<const SphericalPatchPoint *> identities;
-    std::unordered_map<const SphericalPatchPoint *,Eigen::Vector2d> local;
     double gain = 1.0, bias = 0.0, mean = 0.0;
     bool gain_constrained = false;
     Eigen::Matrix<double, 6, 2> coupling = Eigen::Matrix<double, 6, 2>::Zero();
     Eigen::Matrix2d information = Eigen::Matrix2d::Zero();
     Eigen::Vector2d gradient = Eigen::Vector2d::Zero();
-  };
-  std::map<int, BrightnessGroup> brightness_groups;
-  camera_affine = camera_affine || spherical_shared_brightness_en;
-  if (camera_affine && per_patch_affine)
+  } group;
+  group.gain = spherical_brightness_prior_gain;
+  group.bias = spherical_brightness_prior_bias;
+  bool brightness_valid = !spherical_brightness_en;
+  if (spherical_brightness_en)
   {
-    // A single camera pair shares brightness parameters across its patches.
-    // Preserve the source camera ID because references can migrate across views.
     for (const auto &observation : spherical_selected)
     {
       const auto &patch = *observation.point;
-      if (spherical_shared_brightness_en && !patch.normalized_brightness) continue;
-      if (level > 0 && level > static_cast<int>(patch.coarse_world.size())) continue;
-      const auto &world = level == 0 ? patch.patch_world : patch.coarse_world[level - 1];
-      const auto &reference = level == 0 ? patch.intensity : patch.coarse_intensity[level - 1];
+      const auto &world = patch.patch_world;
+      const auto &reference = patch.intensity;
       if (world.empty() || world.size() != reference.size()) continue;
-      std::vector<double> values;
+      std::vector<float> values;
       double sc = 0, sr = 0, scc = 0, srr = 0, scr = 0;
       bool visible = true;
       for (size_t j = 0; j < world.size(); ++j)
@@ -627,10 +485,8 @@ void VIOManager::linearizeSpherical(MD(6, 6) &information, MD(6, 1) &gradient,
         const V3D point = current_Rcw * world[j] + current_Pcw;
         float value;
         V2D unused_derivative;
-        const bool sampled = point.z() > .2 && (spherical_shared_brightness_en
-              ? sampleGrayGradient(current_image,cam->world2cam(point)/scale,value,unused_derivative)
-              : sampleGray(current_image,cam->world2cam(point)/scale,value));
-        if (!sampled)
+        if (point.z() <= sphere::kMinDepth ||
+            !sampleGrayGradient(spherical_gray, cam->world2cam(point), value, unused_derivative))
         { visible = false; break; }
         values.push_back(value);
         sc += value; sr += reference[j]; scc += value * value;
@@ -642,67 +498,41 @@ void VIOManager::linearizeSpherical(MD(6, 6) &information, MD(6, 1) &gradient,
       const double variance = std::max(0.0, scc - sc * sc / count);
       const double reference_variance = std::max(0.0, srr - sr * sr / count);
       const double zncc = covariance / std::sqrt(std::max(variance * reference_variance, 1e-12));
-      if (min_zncc > -1.0 && (!std::isfinite(zncc) || zncc < min_zncc)) continue;
-      auto &group = brightness_groups[spherical_shared_brightness_en ? 0 : patch.reference_camera_id];
-      if (spherical_local_brightness_en)
-      { group.blocks.emplace_back(); group.identities.push_back(observation.point.get()); }
+      if (!std::isfinite(zncc) || zncc < spherical_min_zncc) continue;
       for (size_t j = 0; j < values.size(); ++j)
       {
-        double measurement_weight = observation.weight;
-        if (spherical_shared_brightness_en && spherical_geometry_support_en)
+        double measurement_weight = 1.0;
+        if (spherical_geometry_support_en)
         {
-          const auto &variance = level == 0 ? patch.range_variance : patch.coarse_range_variance[level-1];
-          if (variance.size() != world.size()) { measurement_weight = 0; }
+          if (patch.range_variance.size() != world.size()) { measurement_weight = 0; }
           else
           {
             const V3D pc = current_Rcw*world[j]+current_Pcw;
             V2D image_derivative; float unused_value;
             MD(2,3) projection;
-            if (!sampleGrayGradient(current_image,cam->world2cam(pc)/scale,unused_value,image_derivative))
+            if (!sampleGrayGradient(spherical_gray,cam->world2cam(pc),unused_value,image_derivative))
               measurement_weight = 0;
             else
             {
               computeProjectionJacobian(pc,projection);
               const V3D ray = (world[j]-patch.geometry_origin_w).normalized();
-              const double sensitivity = (spherical_brightness_prior_gain/scale)*image_derivative.transpose()*projection*current_Rcw*ray;
-              measurement_weight *= img_point_cov/(img_point_cov+sensitivity*sensitivity*variance[j]);
+              const double sensitivity = spherical_brightness_prior_gain*image_derivative.transpose()*projection*current_Rcw*ray;
+              measurement_weight *= img_point_cov/(img_point_cov+sensitivity*sensitivity*patch.range_variance[j]);
             }
           }
         }
         group.samples.emplace_back(values[j],reference[j]);
         group.weights.push_back(measurement_weight);
-        if (spherical_local_brightness_en)
-        {
-          group.blocks.back().samples.emplace_back(values[j],reference[j]);
-          group.blocks.back().weights.push_back(measurement_weight);
-        }
       }
     }
-    for (auto &entry : brightness_groups)
+    if (!group.samples.empty())
     {
-      auto &group = entry.second;
-      if (spherical_shared_brightness_en)
+      const auto fit = fitSphericalBrightness(group.samples,group.weights,spherical_brightness_prior_gain,
+                                              spherical_brightness_prior_bias,img_point_cov,huber);
+      if (!fit.valid) ++spherical_brightness_fit_rejections;
+      else
       {
-        if (spherical_local_brightness_en)
-        {
-          const Eigen::Vector2d prior(spherical_brightness_prior_gain,spherical_brightness_prior_bias);
-          const auto fit = fitSphericalHierarchicalBrightness(group.blocks,prior,img_point_cov);
-          if (!fit.valid) { ++spherical_brightness_fit_rejections; group.samples.clear(); continue; }
-          group.gain = fit.global(0); group.bias = fit.global(1); group.mean = 0;
-          group.information.diagonal() << img_point_cov/.0225,img_point_cov/100;
-          group.gradient = group.information*(fit.global-prior);
-          for (size_t i = 0; i < fit.local.size(); ++i)
-          {
-            group.local[group.identities[i]] = fit.local[i];
-            spherical_fitted_local_brightness[group.identities[i]] = fit.local[i];
-          }
-          spherical_fitted_brightness_gain = group.gain;
-          spherical_fitted_brightness_bias = group.bias;
-          continue;
-        }
-        const auto fit = fitSphericalBrightness(group.samples,spherical_brightness_prior_gain,
-             spherical_brightness_prior_bias,img_point_cov,.0225,100,&group.weights,spherical_bounded_brightness_en);
-        if (!fit.valid) { ++spherical_brightness_fit_rejections; group.samples.clear(); continue; }
+        brightness_valid = true;
         group.gain = fit.gain; group.bias = fit.bias; group.mean = fit.mean;
         group.information = fit.centered_prior;
         group.gradient = fit.centered_prior_gradient;
@@ -711,43 +541,26 @@ void VIOManager::linearizeSpherical(MD(6, 6) &information, MD(6, 1) &gradient,
         {
           ++spherical_brightness_bound_fits;
           // Active-set Gauss-Newton curvature, conditional on the active
-          // gain bound: only bias is a free radiometric direction. This is
-          // not the covariance of a full truncated-Gaussian posterior.
+          // gain bound: only bias is a free radiometric direction, with unit
+          // prior information. This is not the covariance of a full
+          // truncated-Gaussian posterior.
           group.mean = 0;
           group.information.setZero();
-          group.information.diagonal() << 1.,img_point_cov/100.;
-          group.gradient << 0.,(img_point_cov/100.)*(group.bias-spherical_brightness_prior_bias);
+          group.information.diagonal() << 1.,1.;
+          group.gradient << 0.,group.bias-spherical_brightness_prior_bias;
         }
         spherical_fitted_brightness_gain = fit.gain;
         spherical_fitted_brightness_bias = fit.bias;
-        continue;
-      }
-      for (int fit = 0; fit < 3; ++fit)
-      {
-        double weight_sum = 0, sc = 0, sr = 0, scc = 0, scr = 0;
-        for (const auto &sample : group.samples)
-        {
-          const double residual = group.gain * sample.first + group.bias - sample.second;
-          const double weight = fit == 0 ? 1.0 : std::min(1.0, 20.0 / std::max(std::abs(residual), 1e-9));
-          weight_sum += weight; sc += weight * sample.first; sr += weight * sample.second;
-          scc += weight * sample.first * sample.first; scr += weight * sample.first * sample.second;
-        }
-        if (weight_sum <= 0) break;
-        group.mean = sc / weight_sum;
-        const double variance = scc - sc * sc / weight_sum;
-        group.gain = std::max(0.5, std::min(2.0, (scr - sc * sr / weight_sum) / std::max(variance, 1.0)));
-        group.bias = sr / weight_sum - group.gain * group.mean;
       }
     }
   }
 
   for (auto &observation : spherical_selected)
   {
+    if (!brightness_valid) break;
     const auto &patch = *observation.point;
-    if (spherical_shared_brightness_en && !patch.normalized_brightness) continue;
-    if (level > 0 && level > static_cast<int>(patch.coarse_world.size())) continue;
-    const auto &world_samples = level == 0 ? patch.patch_world : patch.coarse_world[level - 1];
-    const auto &reference_samples = level == 0 ? patch.intensity : patch.coarse_intensity[level - 1];
+    const auto &world_samples = patch.patch_world;
+    const auto &reference_samples = patch.intensity;
     const size_t count = world_samples.size();
     if (count != reference_samples.size() || count == 0) continue;
     std::vector<float> current(count);
@@ -758,9 +571,8 @@ void VIOManager::linearizeSpherical(MD(6, 6) &information, MD(6, 1) &gradient,
     for (size_t j = 0; j < count; ++j)
     {
       camera_points[j] = current_Rcw * world_samples[j] + current_Pcw;
-      if (camera_points[j].z() <= 0.2 ||
-          !sampleGrayGradient(current_image, cam->world2cam(camera_points[j]) / scale,
-                              current[j], gradients[j]))
+      if (camera_points[j].z() <= sphere::kMinDepth ||
+          !sampleGrayGradient(spherical_gray, cam->world2cam(camera_points[j]), current[j], gradients[j]))
       {
         visible = false;
         break;
@@ -770,82 +582,28 @@ void VIOManager::linearizeSpherical(MD(6, 6) &information, MD(6, 1) &gradient,
     }
     if (!visible) continue;
 
-    double gain = 1.0;
-    double bias = 0.0;
-    if (per_patch_affine || min_zncc > -1.0)
-    {
-      const double mean_current = sum_current / count;
-      const double mean_reference = sum_reference / count;
-      double covariance = 0.0, variance = 0.0, reference_variance = 0.0;
-      for (size_t j = 0; j < count; ++j)
-      {
-        covariance += (current[j] - mean_current) * (reference_samples[j] - mean_reference);
-        variance += (current[j] - mean_current) * (current[j] - mean_current);
-        reference_variance += (reference_samples[j] - mean_reference) *
-                              (reference_samples[j] - mean_reference);
-      }
-      if (min_zncc > -1.0)
-      {
-        const double zncc = covariance /
-                            std::sqrt(std::max(variance * reference_variance, 1e-12));
-        if (!std::isfinite(zncc) || zncc < min_zncc) continue;
-      }
-      if (per_patch_affine && !camera_affine)
-      {
-        const double gain_ratio = gain_only ? (covariance + count * mean_current * mean_reference) /
-                                                 std::max(variance + count * mean_current * mean_current, 1.0)
-                                           : covariance / std::max(variance, 1.0);
-        gain = std::max(0.5, std::min(2.0, gain_ratio));
-        bias = gain_only ? 0.0 : mean_reference - gain * mean_current;
-      }
-    }
-    if (camera_affine && per_patch_affine)
-    {
-      const auto fit = brightness_groups.find(spherical_shared_brightness_en ? 0 : patch.reference_camera_id);
-      if (fit == brightness_groups.end() || fit->second.samples.empty()) continue;
-      gain = fit->second.gain;
-      bias = fit->second.bias;
-      if (spherical_local_brightness_en)
-      {
-        const auto local = fit->second.local.find(observation.point.get());
-        if (local == fit->second.local.end()) continue;
-        gain += local->second(0); bias += local->second(1);
-      }
-    }
-    double patch_cost = 0.0;
+    const double mean_current = sum_current / count;
+    const double mean_reference = sum_reference / count;
+    double covariance = 0.0, variance = 0.0, reference_variance = 0.0;
     for (size_t j = 0; j < count; ++j)
     {
-      const double residual = gain * current[j] + bias - reference_samples[j];
-      patch_cost += residual * residual;
+      covariance += (current[j] - mean_current) * (reference_samples[j] - mean_reference);
+      variance += (current[j] - mean_current) * (current[j] - mean_current);
+      reference_variance += (reference_samples[j] - mean_reference) *
+                            (reference_samples[j] - mean_reference);
     }
-    // Keep the pooled fit and pose equations on identical support. Huber
-    // handles residual outliers; a post-fit MSE cut changes the optimum.
-    if (!spherical_shared_brightness_en && patch_cost / count > 900.0) continue;
-    if (spherical_geometry_support_en)
-    {
-      if (level > 0 && level > static_cast<int>(patch.coarse_range_variance.size())) continue;
-      const auto &variance = level == 0 ? patch.range_variance : patch.coarse_range_variance[level-1];
-      if (variance.size() != count) continue;
-    }
+    const double zncc = covariance / std::sqrt(std::max(variance * reference_variance, 1e-12));
+    if (!std::isfinite(zncc) || zncc < spherical_min_zncc) continue;
+    if (spherical_geometry_support_en && patch.range_variance.size() != count) continue;
+    const double gain = group.gain;
+    const double bias = group.bias;
 
     ++valid_patches;
-    if (fixed_support)
-      fixed_support->push_back({observation.point, level, gain, bias, observation.weight, {}});
-    if (fixed_support && spherical_local_brightness_en)
-    {
-      const auto &group = brightness_groups[0];
-      fixed_support->back().global_gain = group.gain;
-      fixed_support->back().global_bias = group.bias;
-      fixed_support->back().local_brightness = group.local.at(observation.point.get());
-    }
+    if (fixed_support) fixed_support->push_back({observation.point, gain, bias, {}});
     MD(6, 6) patch_information = MD(6, 6)::Zero();
     MD(6, 1) patch_gradient = MD(6, 1)::Zero();
-    Eigen::Matrix<double, 6, 2> pose_brightness = Eigen::Matrix<double, 6, 2>::Zero();
-    Eigen::Matrix2d brightness_information = Eigen::Matrix2d::Zero();
-    Eigen::Vector2d brightness_gradient = Eigen::Vector2d::Zero();
     Eigen::Matrix<double,6,2> raw_brightness_coupling = Eigen::Matrix<double,6,2>::Zero();
     Eigen::Matrix2d raw_brightness_information = Eigen::Matrix2d::Zero();
-    Eigen::Vector2d raw_brightness_gradient = Eigen::Vector2d::Zero();
     for (size_t j = 0; j < count; ++j)
     {
       const V3D &camera_point = camera_points[j];
@@ -853,7 +611,7 @@ void VIOManager::linearizeSpherical(MD(6, 6) &information, MD(6, 1) &gradient,
       computeProjectionJacobian(camera_point, projection_jacobian);
       M3D point_skew;
       point_skew << SKEW_SYM_MATRX(camera_point);
-      const Eigen::Matrix<double, 1, 2> image_jacobian = (gain / scale) * gradients[j].transpose();
+      const Eigen::Matrix<double, 1, 2> image_jacobian = gain * gradients[j].transpose();
       const Eigen::Matrix<double, 1, 3> angle_jacobian = image_jacobian * projection_jacobian * point_skew;
       const Eigen::Matrix<double, 1, 3> point_jacobian = -image_jacobian * projection_jacobian;
       MD(1, 6) h;
@@ -863,83 +621,38 @@ void VIOManager::linearizeSpherical(MD(6, 6) &information, MD(6, 1) &gradient,
       double geometry_weight = 1.0;
       if (spherical_geometry_support_en)
       {
-        const auto &variance = level == 0 ? patch.range_variance : patch.coarse_range_variance[level-1];
         const V3D ray = (world_samples[j]-patch.geometry_origin_w).normalized();
-        const double sensitivity = (spherical_shared_brightness_en ? spherical_brightness_prior_gain/gain : 1.0)*
+        const double sensitivity = (spherical_brightness_prior_gain/gain)*
                                    image_jacobian*projection_jacobian*current_Rcw*ray;
-        geometry_weight = img_point_cov/(img_point_cov+sensitivity*sensitivity*variance[j]);
+        geometry_weight = img_point_cov/(img_point_cov+sensitivity*sensitivity*patch.range_variance[j]);
       }
-      const double measurement_weight = observation.weight*geometry_weight;
+      const double measurement_weight = geometry_weight;
       if (fixed_support) fixed_support->back().sample_weights.push_back(measurement_weight);
       const double weight = measurement_weight *
-                            std::min(1.0, 20.0 / std::max(std::abs(residual), 1e-9));
+                            std::min(1.0, huber / std::max(std::abs(residual), 1e-9));
       patch_information.noalias() += weight * h.transpose() * h;
       patch_gradient.noalias() += weight * h.transpose() * residual;
-      if (marginalize_affine && per_patch_affine && !camera_affine)
+      if (spherical_brightness_en)
       {
-        // Centering the brightness regressor is only a reparameterization,
-        // but avoids ill-conditioning between a large intensity and the bias.
-        const Eigen::Vector2d b(gain_only ? current[j] : current[j] - sum_current / count,
-                               gain_only ? 0.0 : 1.0);
-        pose_brightness.noalias() += weight * h.transpose() * b.transpose();
-        brightness_information.noalias() += weight * b * b.transpose();
-        brightness_gradient.noalias() += weight * b * residual;
-      }
-      if (camera_affine && per_patch_affine)
-      {
-        auto &group = brightness_groups[spherical_shared_brightness_en ? 0 : patch.reference_camera_id];
         const Eigen::Vector2d b(group.gain_constrained ? 0. : current[j]-group.mean,1.0);
-        if (!spherical_local_brightness_en)
-        {
-          group.coupling.noalias() += weight*h.transpose()*b.transpose();
-          group.information.noalias() += weight*b*b.transpose();
-          group.gradient.noalias() += weight*b*residual;
-        }
+        group.coupling.noalias() += weight*h.transpose()*b.transpose();
+        group.information.noalias() += weight*b*b.transpose();
+        group.gradient.noalias() += weight*b*residual;
         const Eigen::Vector2d raw(group.gain_constrained ? 0. : current[j],1);
         raw_brightness_coupling.noalias() += weight*h.transpose()*raw.transpose();
         raw_brightness_information.noalias() += weight*raw*raw.transpose();
-        raw_brightness_gradient.noalias() += weight*raw*residual;
       }
-      cost += fixed_support ? measurement_weight * sphericalHuberCost(residual)
+      cost += fixed_support ? measurement_weight * sphericalHuberCost(residual, huber)
                             : weight * residual * residual;
-    }
-    if (marginalize_affine && per_patch_affine && !camera_affine)
-    {
-      brightness_information.diagonal().array() += 1e-9;
-      const auto brightness_factor = brightness_information.ldlt();
-      // Variable projection: fitted gain and bias are nuisance parameters,
-      // not additional measurements of pose. Remove their information once.
-      patch_information.noalias() -= pose_brightness * brightness_factor.solve(pose_brightness.transpose());
-      patch_gradient.noalias() -= pose_brightness * brightness_factor.solve(brightness_gradient);
-    }
-    // Local shading is uncertain, not an extra hard measurement of pose.
-    // Eliminate its 2x2 block before accumulating the shared camera block.
-    if (spherical_local_brightness_en)
-    {
-      auto &group = brightness_groups[0];
-      Eigen::Matrix2d prior = Eigen::Matrix2d::Zero();
-      prior.diagonal() << img_point_cov/.01,img_point_cov/25;
-      const auto local_information = (raw_brightness_information+prior).eval();
-      const auto factor = local_information.ldlt();
-      const auto local_gradient = (raw_brightness_gradient+prior*group.local.at(observation.point.get())).eval();
-      const auto coupling = raw_brightness_coupling;
-      const auto brightness_information = raw_brightness_information;
-      patch_information.noalias() -= coupling*factor.solve(coupling.transpose());
-      patch_gradient.noalias() -= coupling*factor.solve(local_gradient);
-      raw_brightness_coupling = coupling-coupling*factor.solve(brightness_information);
-      raw_brightness_information = brightness_information-brightness_information*factor.solve(brightness_information);
-      group.coupling += raw_brightness_coupling;
-      group.information += raw_brightness_information;
-      group.gradient += raw_brightness_gradient-brightness_information*factor.solve(local_gradient);
-      cost += img_point_cov*sphericalLocalBrightnessPriorCost(group.local.at(observation.point.get()));
     }
     information += 0.5 * (patch_information + patch_information.transpose()).eval();
     gradient += patch_gradient;
-    if (spherical_shared_brightness_en && spherical_cache_information)
+    if (spherical_brightness_en && spherical_cache_information)
     {
-      Eigen::Matrix2d brightness_factor = Eigen::Matrix2d::Zero();
-      brightness_factor(0,0) = std::sqrt(.0225/img_point_cov);
-      brightness_factor(1,1) = std::sqrt(100.0/img_point_cov);
+      // Whiten pose by the posterior and brightness by its prior (the bias
+      // prior has unit information), then score with brightness marginalized.
+      Eigen::Matrix2d brightness_factor = Eigen::Matrix2d::Identity();
+      brightness_factor(0,0) = std::sqrt(sphere::kGainVariance/img_point_cov);
       observation.posterior_information = spherical_selection_factor.transpose()*patch_information*spherical_selection_factor;
       observation.brightness_coupling = spherical_selection_factor.transpose()*raw_brightness_coupling*brightness_factor;
       observation.brightness_information = brightness_factor.transpose()*raw_brightness_information*brightness_factor;
@@ -950,18 +663,18 @@ void VIOManager::linearizeSpherical(MD(6, 6) &information, MD(6, 1) &gradient,
       { const MD(6,6) lower = factor.matrixL(); observation.score = 2*lower.diagonal().array().log().sum(); }
     }
   }
-  if (camera_affine && per_patch_affine)
+  if (spherical_brightness_en)
   {
-    for (auto &entry : brightness_groups)
+    // Brightness is a nuisance parameter: eliminate the camera's 2x2 block
+    // once, so it is never counted as pose information.
+    if (brightness_valid)
     {
-      auto &group = entry.second;
       group.information.diagonal().array() += 1e-9;
       const auto factor = group.information.ldlt();
       information.noalias() -= group.coupling * factor.solve(group.coupling.transpose());
       gradient.noalias() -= group.coupling * factor.solve(group.gradient);
-      if (spherical_shared_brightness_en && !group.samples.empty())
-        cost += img_point_cov*sphericalBrightnessPriorCost(group.gain,group.bias,spherical_brightness_prior_gain,
-                                                           spherical_brightness_prior_bias);
+      cost += img_point_cov*sphericalBrightnessPriorCost(group.gain,group.bias,spherical_brightness_prior_gain,
+                                                         spherical_brightness_prior_bias,img_point_cov);
     }
     information = 0.5 * (information + information.transpose()).eval();
   }
@@ -973,67 +686,48 @@ bool VIOManager::evaluateSphericalCost(const StatesGroup &pose,
 {
   const M3D rotation = Rci * pose.rot_end.transpose();
   const V3D translation = -rotation * pose.pos_end + Pci;
+  const double huber = photometricHuber();
+  const bool use_fit = fitted_brightness && spherical_brightness_en;
   for (const auto &fixed : support)
   {
-    if (!fixed.point || fixed.level < 0 ||
-        fixed.level >= static_cast<int>(spherical_pyramid.size())) return false;
+    if (!fixed.point) return false;
     const auto &patch = *fixed.point;
-    if (fixed.level > static_cast<int>(patch.coarse_world.size()) ||
-        fixed.level > static_cast<int>(patch.coarse_intensity.size())) return false;
-    const auto &world = fixed.level == 0 ? patch.patch_world : patch.coarse_world[fixed.level - 1];
-    const auto &reference = fixed.level == 0 ? patch.intensity : patch.coarse_intensity[fixed.level - 1];
-    if (world.empty() || world.size() != reference.size() || !std::isfinite(fixed.weight) || fixed.weight <= 0)
+    const auto &world = patch.patch_world;
+    const auto &reference = patch.intensity;
+    if (world.empty() || world.size() != reference.size() || fixed.sample_weights.size() != world.size())
       return false;
-    if (!fixed.sample_weights.empty() && fixed.sample_weights.size() != world.size()) return false;
-    const double scale = static_cast<double>(1 << fixed.level);
-    const double gain = fitted_brightness && spherical_shared_brightness_en ? spherical_fitted_brightness_gain : fixed.gain;
-    const double bias = fitted_brightness && spherical_shared_brightness_en ? spherical_fitted_brightness_bias : fixed.bias;
+    const double gain = use_fit ? spherical_fitted_brightness_gain : fixed.gain;
+    const double bias = use_fit ? spherical_fitted_brightness_bias : fixed.bias;
     for (size_t j = 0; j < world.size(); ++j)
     {
       const V3D projected = rotation * world[j] + translation;
       float value;
-      // No ZNCC/MSE re-gating or brightness refit during a trial. Every
+      // No ZNCC re-gating or brightness refit during a trial. Every
       // original sample must remain visible; leaving the image rejects it.
-      if (projected.z() <= 0.2 ||
-          !sampleGray(spherical_pyramid[fixed.level], cam->world2cam(projected) / scale, value)) return false;
-      const double weight = fixed.sample_weights.empty() ? fixed.weight : fixed.sample_weights[j];
-      double effective_gain = gain, effective_bias = bias;
-      if (spherical_local_brightness_en && fitted_brightness)
-      {
-        auto found = spherical_fitted_local_brightness.find(fixed.point.get());
-        const Eigen::Vector2d local = found == spherical_fitted_local_brightness.end() ? fixed.local_brightness : found->second;
-        effective_gain += local(0); effective_bias += local(1);
-      }
-      cost += weight*sphericalHuberCost(effective_gain*value+effective_bias-reference[j]);
+      if (projected.z() <= sphere::kMinDepth ||
+          !sampleGray(spherical_gray, cam->world2cam(projected), value)) return false;
+      cost += fixed.sample_weights[j]*sphericalHuberCost(gain*value+bias-reference[j], huber);
     }
   }
-  if (spherical_shared_brightness_en && !support.empty())
+  if (spherical_brightness_en && !support.empty())
   {
-    const double gain = fitted_brightness ? spherical_fitted_brightness_gain :
-                        (spherical_local_brightness_en ? support.front().global_gain : support.front().gain);
-    const double bias = fitted_brightness ? spherical_fitted_brightness_bias :
-                        (spherical_local_brightness_en ? support.front().global_bias : support.front().bias);
-    cost += img_point_cov*sphericalBrightnessPriorCost(gain,bias,spherical_brightness_prior_gain,spherical_brightness_prior_bias);
-    if (spherical_local_brightness_en)
-      for (const auto &fixed : support)
-      {
-        auto found = spherical_fitted_local_brightness.find(fixed.point.get());
-        const Eigen::Vector2d local = fitted_brightness && found != spherical_fitted_local_brightness.end() ? found->second : fixed.local_brightness;
-        cost += img_point_cov*sphericalLocalBrightnessPriorCost(local);
-      }
+    const double gain = use_fit ? spherical_fitted_brightness_gain : support.front().gain;
+    const double bias = use_fit ? spherical_fitted_brightness_bias : support.front().bias;
+    cost += img_point_cov*sphericalBrightnessPriorCost(gain,bias,spherical_brightness_prior_gain,
+                                                       spherical_brightness_prior_bias,img_point_cov);
   }
   return std::isfinite(cost);
 }
 
-void VIOManager::insertSphericalMapPoints(const vector<pointWithVar> &points, int budget, int max_probes)
+void VIOManager::insertSphericalMapPoints(const vector<pointWithVar> &points, int budget)
 {
   if (budget <= 0 || points.empty()) return;
   updateFrameState(*state);
   struct Candidate { size_t index; double score; };
   std::vector<Candidate> choices;
   std::unordered_set<VOXEL_LOCATION> visited;
-  const size_t step = std::max<size_t>(1, (points.size() + max_probes - 1) /
-                                             static_cast<size_t>(max_probes));
+  const size_t max_probes = sphere::kProbeBudget;
+  const size_t step = std::max<size_t>(1, (points.size() + max_probes - 1) / max_probes);
   for (size_t i = 0; i < points.size(); i += step)
   {
     const auto &point = points[i];
@@ -1041,18 +735,21 @@ void VIOManager::insertSphericalMapPoints(const vector<pointWithVar> &points, in
     const VOXEL_LOCATION key = sphericalVoxelKey(point.point_w);
     if (!visited.insert(key).second || spherical_map->voxels.count(key)) continue;
     const V3D camera_point = new_frame_->w2f(point.point_w);
-    if (camera_point.z() <= 0.2) continue;
+    if (camera_point.z() <= sphere::kMinDepth) continue;
     const V2D pixel = cam->world2cam(camera_point);
-    if (!cam->isInFrame(pixel.cast<int>(), 8)) continue;
+    if (!cam->isInFrame(pixel.cast<int>(), patch_size)) continue;
     float intensity;
     V2D image_gradient;
     if (!sampleGrayGradient(spherical_gray, pixel, intensity, image_gradient)) continue;
-    if (image_gradient.squaredNorm() < 100.0) continue;
+    // The squared image gradient must exceed the photometric noise variance.
+    if (image_gradient.squaredNorm() < img_point_cov) continue;
     choices.push_back({i, image_gradient.squaredNorm()});
   }
   std::sort(choices.begin(), choices.end(),
             [](const Candidate &a, const Candidate &b) { return a.score > b.score; });
 
+  const M3D rotation = new_frame_->T_f_w_.rotation_matrix();
+  const double angular_step = 1.0 / std::sqrt(fx * fy);
   int inserted = 0;
   for (const auto &choice : choices)
   {
@@ -1063,7 +760,7 @@ void VIOManager::insertSphericalMapPoints(const vector<pointWithVar> &points, in
     {
       if (!spherical_plane_associations || source.visual_plane_index < 0 ||
           source.visual_plane_index >= static_cast<int>(spherical_plane_associations->size()))
-      { ++spherical_geometry_fine_rejections; continue; }
+      { ++spherical_geometry_rejections; continue; }
       association = &(*spherical_plane_associations)[source.visual_plane_index];
     }
     const VOXEL_LOCATION key = sphericalVoxelKey(source.point_w);
@@ -1071,32 +768,26 @@ void VIOManager::insertSphericalMapPoints(const vector<pointWithVar> &points, in
     const V3D normal_w = source.normal.normalized();
     // A whole planar patch should lie on the fitted LiDAR surface, not on
     // the parallel plane passing through a noisy individual range return.
-    const V3D center_w = (spherical_plane_anchor_en || spherical_geometry_support_en)
+    const V3D center_w = spherical_geometry_support_en
                           ? source.point_w - normal_w * normal_w.dot(source.point_w - source.plane_center)
                           : source.point_w;
     const V3D center_camera = new_frame_->w2f(center_w);
-    const V3D normal_camera = new_frame_->T_f_w_.rotation_matrix() * source.normal.normalized();
+    const V3D normal_camera = rotation * normal_w;
     const V2D center_pixel = cam->world2cam(center_camera);
     const V3D bearing = cam->cam2world(center_pixel);
     V3D horizontal = V3D::UnitX() - bearing.x() * bearing;
     if (horizontal.squaredNorm() < 1e-6) continue;
     horizontal.normalize();
     const V3D vertical = bearing.cross(horizontal).normalized();
-    const double angular_step = 1.0 / std::sqrt(fx * fy);
     std::shared_ptr<SphericalPatchPoint> patch(new SphericalPatchPoint());
     patch->map_key = key;
-    patch->reference_camera_id = camera_id;
-    patch->reference_frame_id = spherical_frame_id;
-    patch->normalized_brightness = spherical_shared_brightness_en;
-    patch->reference_brightness_gain = spherical_brightness_gain;
-    patch->reference_brightness_bias = spherical_brightness_bias;
     patch->center_w = center_w;
     patch->normal_w = normal_w;
-    patch->reference_origin_w = new_frame_->f2w(V3D::Zero());
-    patch->geometry_origin_w = patch->reference_origin_w;
+    patch->geometry_origin_w = new_frame_->f2w(V3D::Zero());
     patch->patch_world.reserve(patch_size_total);
     patch->intensity.reserve(patch_size_total);
     bool valid = true;
+    // Equal angular steps of about one pixel around the viewing direction.
     for (int row = 0; row < patch_size && valid; ++row)
     {
       for (int col = 0; col < patch_size; ++col)
@@ -1105,7 +796,7 @@ void VIOManager::insertSphericalMapPoints(const vector<pointWithVar> &points, in
         const double dv = (row - 0.5 * (patch_size - 1)) * angular_step;
         const V3D ray = (bearing + du * horizontal + dv * vertical).normalized();
         const double denominator = normal_camera.dot(ray);
-        if (std::abs(denominator) < 0.05) { valid = false; break; }
+        if (std::abs(denominator) < sphere::kMinRayPlaneCosine) { valid = false; break; }
         const double distance = normal_camera.dot(center_camera) / denominator;
         if (distance <= 0.0 || !std::isfinite(distance)) { valid = false; break; }
         const V3D surface_camera = distance * ray;
@@ -1113,7 +804,7 @@ void VIOManager::insertSphericalMapPoints(const vector<pointWithVar> &points, in
         if (spherical_geometry_support_en)
         {
           double variance = 0.0;
-          const V3D world_ray = new_frame_->T_f_w_.rotation_matrix().transpose()*ray;
+          const V3D world_ray = rotation.transpose()*ray;
           if (!sphericalPlaneSupports(surface_world, source.plane_center, normal_w, association->visual_radius_) ||
               !sphericalPlaneRangeVariance(surface_world, source.plane_center, normal_w, world_ray,
                                              association->plane_var_, variance))
@@ -1126,56 +817,12 @@ void VIOManager::insertSphericalMapPoints(const vector<pointWithVar> &points, in
           valid = false;
           break;
         }
-        patch->patch_world.push_back(new_frame_->f2w(surface_camera));
-        patch->intensity.push_back(spherical_shared_brightness_en ? spherical_brightness_gain*intensity+spherical_brightness_bias : intensity);
+        patch->patch_world.push_back(surface_world);
+        // Canonical brightness, comparable across cameras.
+        patch->intensity.push_back(spherical_brightness_gain*intensity+spherical_brightness_bias);
       }
     }
-    if (!valid) { ++spherical_geometry_fine_rejections; continue; }
-    // The canonical angular chart stays fixed across cameras. At each coarse
-    // scale enlarge the angular support and sample its anti-aliased reference.
-    for (size_t level = 1; level < spherical_pyramid.size(); ++level)
-    {
-      std::vector<V3D> world_samples;
-      std::vector<float> reference_samples;
-      std::vector<double> range_variance;
-      const double scale = static_cast<double>(1 << level);
-      bool coarse_valid = true;
-      for (int row = 0; row < patch_size && coarse_valid; ++row)
-      for (int col = 0; col < patch_size; ++col)
-      {
-        const double du = (col - 0.5 * (patch_size - 1)) * angular_step * scale;
-        const double dv = (row - 0.5 * (patch_size - 1)) * angular_step * scale;
-        const V3D ray = (bearing + du * horizontal + dv * vertical).normalized();
-        const double denominator = normal_camera.dot(ray);
-        if (std::abs(denominator) < 0.05) { coarse_valid = false; break; }
-        const double distance = normal_camera.dot(center_camera) / denominator;
-        const V3D surface_camera = distance * ray;
-        float intensity;
-        if (distance <= 0.0 || !std::isfinite(distance) ||
-            !sampleGray(spherical_pyramid[level], cam->world2cam(surface_camera) / scale, intensity))
-        { coarse_valid = false; break; }
-        world_samples.push_back(new_frame_->f2w(surface_camera));
-        if (spherical_geometry_support_en)
-        {
-          double variance = 0.0;
-          const V3D world_ray = new_frame_->T_f_w_.rotation_matrix().transpose()*ray;
-          if (!sphericalPlaneSupports(world_samples.back(), source.plane_center, normal_w, association->visual_radius_) ||
-              !sphericalPlaneRangeVariance(world_samples.back(), source.plane_center, normal_w, world_ray,
-                                             association->plane_var_, variance))
-          { coarse_valid = false; break; }
-          range_variance.push_back(variance);
-        }
-        reference_samples.push_back(spherical_shared_brightness_en ? spherical_brightness_gain*intensity+spherical_brightness_bias : intensity);
-      }
-      if (!coarse_valid)
-      {
-        world_samples.clear(); reference_samples.clear(); range_variance.clear();
-        ++spherical_geometry_coarse_rejections;
-      }
-      patch->coarse_world.push_back(std::move(world_samples));
-      patch->coarse_intensity.push_back(std::move(reference_samples));
-      patch->coarse_range_variance.push_back(std::move(range_variance));
-    }
+    if (!valid) { ++spherical_geometry_rejections; continue; }
     spherical_map->voxels[key] = patch;
     spherical_map->insertion_order.push_back(key);
     while (spherical_map->voxels.size() > spherical_map->max_points)
@@ -1186,131 +833,6 @@ void VIOManager::insertSphericalMapPoints(const vector<pointWithVar> &points, in
     ++inserted;
   }
   ROS_INFO_THROTTLE(5.0, "Shared spherical map points: %zu", spherical_map->voxels.size());
-}
-
-int VIOManager::refineSphericalGeometry(const vector<pointWithVar> &points, int max_probes)
-{
-  if (points.empty() || spherical_map->voxels.empty()) return 0;
-  const size_t step = std::max<size_t>(1, (points.size() + max_probes - 1) / static_cast<size_t>(max_probes));
-  std::unordered_set<VOXEL_LOCATION> visited;
-  int refined = 0;
-  for (size_t index = 0; index < points.size(); index += step)
-  {
-    const auto &source = points[index];
-    if (source.normal.squaredNorm() < 0.5) continue;
-    const auto key = sphericalVoxelKey(source.point_w);
-    if (!visited.insert(key).second) continue;
-    const auto found = spherical_map->voxels.find(key);
-    if (found == spherical_map->voxels.end()) continue;
-    auto &patch = *found->second;
-    V3D normal = source.normal.normalized();
-    if (normal.dot(patch.normal_w) < 0) normal = -normal;
-    // A different plane in the same voxel must not replace the reference.
-    if (normal.dot(patch.normal_w) < 0.9659258262890683) continue;
-    auto intersect = [&](const V3D &old, V3D &updated)
-    {
-      const V3D bearing = (old - patch.reference_origin_w).normalized();
-      const double denominator = normal.dot(bearing);
-      if (std::abs(denominator) < 0.05) return false;
-      const double range = normal.dot(source.plane_center - patch.reference_origin_w) / denominator;
-      if (range <= 0 || !std::isfinite(range)) return false;
-      updated = patch.reference_origin_w + range * bearing;
-      return updated.allFinite() && (updated - old).norm() <= 0.1;
-    };
-    V3D new_center;
-    if (!intersect(patch.center_w, new_center) || !(sphericalVoxelKey(new_center) == key)) continue;
-    auto new_world = patch.patch_world;
-    auto new_coarse = patch.coarse_world;
-    bool valid = true;
-    for (size_t k = 0; k < new_world.size(); ++k)
-      if (!intersect(patch.patch_world[k], new_world[k])) { valid = false; break; }
-    for (size_t level = 0; level < new_coarse.size() && valid; ++level)
-      for (size_t k = 0; k < new_coarse[level].size(); ++k)
-        if (!intersect(patch.coarse_world[level][k], new_coarse[level][k])) { valid = false; break; }
-    if (!valid) continue;
-    // The original viewing rays remain unchanged, so their reference image
-    // samples stay valid. No full reference image or per-camera map is needed.
-    patch.center_w = new_center;
-    patch.normal_w = normal;
-    patch.patch_world = std::move(new_world);
-    patch.coarse_world = std::move(new_coarse);
-    ++refined;
-  }
-  ROS_INFO_THROTTLE(5.0, "Spherical geometry refinements: %d", refined);
-  return refined;
-}
-
-int VIOManager::refreshSphericalReferences(int budget, double min_zncc)
-{
-  if (budget <= 0 || spherical_selected.empty()) return 0;
-  updateFrameState(*state);
-  const V3D origin = new_frame_->f2w(V3D::Zero());
-  int refreshed = 0;
-  for (const auto &observation : spherical_selected)
-  {
-    if (refreshed >= budget) break;
-    auto &patch = *observation.point;
-    const int age = spherical_frame_id - patch.reference_frame_id;
-    if (age < 5) continue; // Also prevents two cameras overwriting it in one packet.
-    const double old_cos = std::abs(patch.normal_w.dot((patch.center_w - patch.reference_origin_w).normalized()));
-    const double new_cos = std::abs(patch.normal_w.dot((patch.center_w - origin).normalized()));
-    if (!std::isfinite(new_cos) || new_cos < 0.2) continue;
-    const bool improved_view = new_cos > old_cos + 0.1;
-    const bool stale_good_view = age >= 30 && new_cos >= old_cos - 0.02;
-    if (!improved_view && !stale_good_view) continue;
-    const size_t count = patch.patch_world.size();
-    if (!count || count != patch.intensity.size()) continue;
-    std::vector<float> values(count);
-    double sc = 0, sr = 0, scc = 0, srr = 0, scr = 0;
-    bool visible = true;
-    for (size_t k = 0; k < count; ++k)
-    {
-      const V3D pc = new_frame_->w2f(patch.patch_world[k]);
-      if (pc.z() <= 0.2 || !sampleGray(spherical_gray, cam->world2cam(pc), values[k]))
-      { visible = false; break; }
-      const double r = patch.intensity[k];
-      sc += values[k]; sr += r; scc += values[k]*values[k];
-      srr += r*r; scr += values[k]*r;
-    }
-    if (!visible) continue;
-    const double covariance = scr - sc * sr / count;
-    const double vc = std::max(0.0, scc - sc * sc / count);
-    const double vr = std::max(0.0, srr - sr * sr / count);
-    if (vc / count < 16 || vr / count < 16) continue;
-    const double zncc = covariance / std::sqrt(std::max(vc*vr, 1e-12));
-    if (!std::isfinite(zncc) || zncc < min_zncc) continue;
-    const double gain = std::max(0.5, std::min(2.0, covariance / std::max(vc, 1.0)));
-    const double bias = sr / count - gain * sc / count;
-    double error = 0;
-    for (size_t k = 0; k < count; ++k)
-    {
-      const double residual = gain * values[k] + bias - patch.intensity[k];
-      error += residual * residual;
-    }
-    if (error / count > 100) continue;
-    auto coarse = patch.coarse_intensity;
-    for (size_t level = 0; level < patch.coarse_world.size() && visible; ++level)
-    {
-      const double scale = static_cast<double>(1 << (level + 1));
-      for (size_t k = 0; k < patch.coarse_world[level].size(); ++k)
-      {
-        const V3D pc = new_frame_->w2f(patch.coarse_world[level][k]);
-        if (pc.z() <= 0.2 || !sampleGray(spherical_pyramid[level + 1], cam->world2cam(pc)/scale, coarse[level][k]))
-        { visible = false; break; }
-      }
-    }
-    if (!visible) continue;
-    // Keep the common 3D support fixed. Replace only its appearance with a
-    // verified posterior-pose observation: no image history or per-camera map.
-    patch.intensity = std::move(values);
-    patch.coarse_intensity = std::move(coarse);
-    patch.reference_camera_id = camera_id;
-    patch.reference_origin_w = origin;
-    patch.reference_frame_id = spherical_frame_id;
-    ++refreshed;
-  }
-  ROS_INFO_THROTTLE(5.0, "Spherical references refreshed: %d on camera %d", refreshed, camera_id);
-  return refreshed;
 }
 
 void VIOManager::getImagePatch(cv::Mat img, V2D pc, float *patch_tmp, int level)

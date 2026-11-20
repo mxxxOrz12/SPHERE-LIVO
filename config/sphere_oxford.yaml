@@ -28,31 +28,6 @@ imu:
   gyr_cov: 0.1
   imu_en: true
   imu_int_frame: 30
-innovations:
-  information_selection: true
-  joint_fixed_budget: true
-  joint_max_iterations: 3
-  map_insert_budget_per_camera: 30
-  max_active_cameras: 2
-  shared_spherical_map: true
-  spherical_affine: true
-  spherical_bounded_brightness: true
-  spherical_descent_guard: true
-  spherical_geometry_support: true
-  spherical_incremental_information: true
-  spherical_local_brightness: false
-  spherical_map_max_points: 15000
-  spherical_marginalize_affine: false
-  spherical_min_zncc: 0.8
-  spherical_patch: true
-  spherical_posterior_information: true
-  spherical_prefilter_zncc: true
-  spherical_probe_budget: 2048
-  spherical_pyramid_levels: 1
-  spherical_shared_brightness: true
-  spherical_temporal_retrieval: true
-  spherical_transactional_update: true
-  total_patch_budget: 120
 lio:
   beam_err: 0.05
   dept_err: 0.02
@@ -186,11 +161,8 @@ time_offset:
   lidar_time_offset: 0.0
 vio:
   exposure_estimate_en: false
-  img_point_cov: 100
   inverse_composition_en: false
-  max_iterations: 5
   normal_en: true
   outlier_threshold: 78
   patch_pyrimid_level: 4
-  patch_size: 8
   raycast_en: false

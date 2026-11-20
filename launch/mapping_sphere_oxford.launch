@@ -1,7 +1,9 @@
 <launch>
-  <arg name="config" default="$(find fast_livo)/config/sphere_oxford.yaml" />
   <arg name="seq_name" default="sphere_oxford" />
-  <rosparam command="load" file="$(arg config)" />
-  <param name="/evo/seq_name" value="$(arg seq_name)" />
-  <node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen" />
+  <arg name="ablation" default="none" />
+  <include file="$(find fast_livo)/launch/mapping_sphere.launch">
+    <arg name="sensor_config" value="$(find fast_livo)/config/sphere_oxford.yaml" />
+    <arg name="seq_name" value="$(arg seq_name)" />
+    <arg name="ablation" value="$(arg ablation)" />
+  </include>
 </launch>

@@ -13,8 +13,9 @@ joint visual update with a configurable patch budget. The ROS package remains
 - Calibrated equidistant fisheye cameras with raw or JPEG-compressed ROS images.
 - World-anchored spherical patches shared across cameras using local LiDAR planes.
 - Camera and patch selection informed by LiDAR geometric constraints.
-- Configurable camera, patch, candidate-probe and visual-map budgets.
-- Optional brightness models, geometry support and guarded visual updates.
+- Per-camera affine brightness to a canonical scale and a guarded joint update.
+- One method configuration for every dataset: nine parameters (four of them
+  ablation switches), with all fixed constants in one header.
 - TUM trajectories, visual timing logs and reconstructed PCD point clouds.
 
 This is research software. Current experiments do **not** establish a consistent
@@ -48,14 +49,37 @@ The Sophus library path above assumes the upstream `/usr/local` installation.
 Adjust it to your installation. Serial compilation is recommended on machines
 with limited memory. Dataset files and compiled dependencies are not included.
 
+## Configuration
+
+Each run loads two files:
+
+- a **sensor configuration** per dataset or rig: topics, LiDAR/IMU settings,
+  camera calibration and outputs (for example `config/sphere_oxford.yaml`);
+- the **method configuration** `config/sphere_method.yaml`, identical for every
+  dataset. It holds the nine SPHERE-LIVO parameters and the three visual-update
+  settings (`img_point_cov`, `patch_size`, `max_iterations`).
+
+Fixed constants, and the quantities derived from the method parameters, are
+listed in `include/sphere_constants.h`. An unknown key under `innovations` is
+rejected at start-up, so configurations from earlier versions fail loudly
+instead of silently running a different method.
+
+Ablations overlay one file from `config/ablation` on the method configuration:
+`fastlivo2_baseline`, `no_shared_map`, `no_geometry_support`,
+`no_brightness_model` and `texture_selection`.
+
+```bash
+roslaunch fast_livo mapping_sphere.launch \
+  sensor_config:=/absolute/path/to/dataset.yaml seq_name:=run01 ablation:=none
+```
+
 ## Oxford Spires example
 
-`config/sphere_oxford.yaml` is the complete preset used in the successful
-migration replay check. It enables the current SPHERE-LIVO profile and point
-cloud saving. It differs from the older experimental presets retained in
-`config/oxford_spires_observatory_01.yaml`.
+`config/sphere_oxford.yaml` is the Oxford Spires sensor configuration.
+`mapping_sphere_oxford.launch` loads it with the shared method configuration
+and enables point cloud saving.
 
-First terminal:
+First terminal (add `ablation:=<name>` for an ablation):
 
 ```bash
 source ~/sphere_ws/devel/setup.bash
@@ -97,9 +121,12 @@ python3 scripts/evaluate_oxford_tum.py \
   --config config/sphere_oxford.yaml
 ```
 
-The current algorithm source was compiled and replayed on 30-second prefixes of
-Hilti exp04 and Oxford Observatory-01 before publication. These are functional
-checks of trajectory and point-cloud output, not full-sequence accuracy claims.
+The algorithm of commit 804e82c was compiled and replayed on 30-second prefixes
+of Hilti exp04 and Oxford Observatory-01. These are functional checks of
+trajectory and point-cloud output, not full-sequence accuracy claims. The
+parameter consolidation that followed removed configuration paths not used by
+the Oxford preset; on a synthetic three-camera scene it reproduces the earlier
+preset bit for bit, but it has not yet been replayed on the datasets.
 Full datasets, experiment outputs and the Omni-LIVO comparison implementation are
 managed separately.
 
@@ -122,6 +149,9 @@ citations and additional upstream examples.
 
 SPHERE-LIVO 是基于 FAST-LIVO2 的多鱼眼激光–惯性–视觉里程计研究实现，
 包含共享球面补丁、信息驱动的观测选择以及联合视觉更新。
-ROS 包名仍为 `fast_livo`。建议使用上面的 `mapping_sphere_oxford.launch`
-运行当前配置，轨迹和点云保存在源码目录的 `Log/` 下。
+ROS 包名仍为 `fast_livo`。每次运行加载两份配置：数据集各自的传感器配置
+（话题、标定、LiDAR/IMU），以及所有数据集共用的方法配置
+`config/sphere_method.yaml`；固定常数集中在 `include/sphere_constants.h`。
+消融实验通过 `ablation:=<config/ablation 中的文件名>` 切换。
+Oxford 使用 `mapping_sphere_oxford.launch`，轨迹和点云保存在源码目录的 `Log/` 下。
 现有实验尚未证明相对 Omni-LIVO 存在稳定的精度优势；请根据序列实测评估。
