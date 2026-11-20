@@ -107,6 +107,17 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<int>("innovations/spherical_probe_budget", spherical_probe_budget, 2048);
   nh.param<int>("innovations/joint_max_iterations", joint_max_iterations, 3);
   nh.param<int>("innovations/spherical_map_max_points", spherical_map_max_points, 15000);
+  nh.param<int>("innovations/spherical_shortlist_per_camera", spherical_shortlist_per_camera, 120);
+  nh.param<int>("innovations/spherical_pool_size", spherical_pool_size, 360);
+  nh.param<int>("innovations/spherical_min_patches_per_camera", spherical_min_patches_per_camera, 0);
+  nh.param<double>("innovations/spherical_chi2_gate", spherical_chi2_gate, 0.0);
+  nh.param<double>("innovations/spherical_max_correction_m", spherical_max_correction_m, 0.0);
+  nh.param<double>("innovations/spherical_max_correction_deg", spherical_max_correction_deg, 0.0);
+  if (spherical_shortlist_per_camera < 1 || spherical_pool_size < 1 || spherical_min_patches_per_camera < 0 ||
+      !std::isfinite(spherical_chi2_gate) || spherical_chi2_gate < 0.0 ||
+      !std::isfinite(spherical_max_correction_m) || spherical_max_correction_m < 0.0 ||
+      !std::isfinite(spherical_max_correction_deg) || spherical_max_correction_deg < 0.0)
+    throw std::runtime_error("Invalid spherical shortlist, pool, per-camera minimum or correction gate");
   if (spherical_patch_en && (!multi_fisheye_en || max_active_cameras < 1 ||
       total_patch_budget < 1 || map_insert_budget_per_camera < 1 ||
       spherical_probe_budget < 1 || joint_max_iterations < 1 || spherical_map_max_points < 1))
@@ -119,6 +130,7 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
     nh.param<double>("multi_fisheye/sync_tolerance", camera_sync_tolerance, 0.005);
     nh.param<bool>("multi_fisheye/compressed_images", compressed_images, false);
     nh.param<int>("multi_fisheye/frame_stride", camera_frame_stride, 1);
+    nh.param<int>("multi_fisheye/frame_phase", camera_frame_phase, 0);
     if (camera_count < 2 || camera_count > 6 || camera_sync_tolerance <= 0.0 || camera_frame_stride < 1)
       throw std::runtime_error("multi_fisheye requires 2-6 cameras, positive sync_tolerance and frame_stride >= 1");
     for (int i = 0; i < camera_count; ++i)
@@ -217,6 +229,8 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<double>("preprocess/blind", p_pre->blind, 0.01);
   nh.param<double>("preprocess/filter_size_surf", filter_size_surf_min, 0.5);
   nh.param<bool>("preprocess/hilti_en", hilti_en, false);
+  if (multi_fisheye_en && (camera_frame_phase < 0 || camera_frame_phase >= (hilti_en ? 4 : camera_frame_stride)))
+    throw std::runtime_error("multi_fisheye/frame_phase must be in [0, frame_stride)");
   nh.param<int>("preprocess/lidar_type", p_pre->lidar_type, AVIA);
   nh.param<int>("preprocess/scan_line", p_pre->N_SCANS, 6);
   nh.param<int>("preprocess/point_filter_num", p_pre->point_filter_num, 3);
@@ -352,7 +366,7 @@ void LIVMapper::initializeFiles()
   if (multi_fisheye_en)
   {
     fout_vio_timing.open(std::string(ROOT_DIR) + "Log/result/" + seq_name + "_timing.csv", std::ios::out);
-    fout_vio_timing << "timestamp,mode,cameras,selected_patches,vio_ms,map_points,active_ids,lidar_weak_ratio,camera_scores,accepted_patches,camera_quotas,refreshed_patches,temporal_selected_patches,guard_accepted_steps,guard_rejected_steps,guard_backtracks,guard_initial_cost,guard_final_cost,guard_status,incremental_pool_size,unique_world_patches,geometry_fine_rejections,geometry_coarse_rejections,brightness_gains,brightness_biases,brightness_fit_rejections,brightness_bound_fits\n";
+    fout_vio_timing << "timestamp,mode,cameras,selected_patches,vio_ms,map_points,active_ids,lidar_weak_ratio,camera_scores,accepted_patches,camera_quotas,refreshed_patches,temporal_selected_patches,guard_accepted_steps,guard_rejected_steps,guard_backtracks,guard_initial_cost,guard_final_cost,guard_status,incremental_pool_size,unique_world_patches,geometry_fine_rejections,geometry_coarse_rejections,brightness_gains,brightness_biases,brightness_fit_rejections,brightness_bound_fits,correction_chi2,chi2_rejections\n";
   }
 }
 
@@ -541,7 +555,8 @@ void LIVMapper::handleVIO()
                     << last_incremental_pool_size << ',' << last_unique_world_patches << ','
                     << last_geometry_fine_rejections << ',' << last_geometry_coarse_rejections << ','
                     << last_spherical_brightness_gains << ',' << last_spherical_brightness_biases << ','
-                    << last_brightness_fit_rejections << ',' << last_brightness_bound_fits << '\n';
+                    << last_brightness_fit_rejections << ',' << last_brightness_bound_fits << ','
+                    << last_visual_correction_chi2 << ',' << last_visual_chi2_rejections << '\n';
   }
   // All camera images share a capture time. Reproject using the final fused
   // state, including the updates from cameras processed later in the group.
@@ -1157,6 +1172,8 @@ void LIVMapper::runSphericalVIO(const std::vector<cv::Mat> &images)
   last_geometry_coarse_rejections = 0;
   last_brightness_fit_rejections = 0;
   last_brightness_bound_fits = 0;
+  last_visual_chi2_rejections = 0;
+  last_visual_correction_chi2 = -1.0;
   // The smallest eigenvector of LiDAR's weighted translational Hessian is
   // the direction along which this scan provides the least information.
   V3D weak_world = V3D::UnitX();
@@ -1211,6 +1228,7 @@ void LIVMapper::runSphericalVIO(const std::vector<cv::Mat> &images)
   {
     manager->spherical_geometry_support_en = spherical_geometry_support_en;
     manager->spherical_shared_brightness_en = spherical_shared_brightness_en;
+    manager->spherical_shortlist_per_camera = spherical_shortlist_per_camera;
     manager->spherical_local_brightness_en = spherical_local_brightness_en;
     manager->spherical_bounded_brightness_en = spherical_bounded_brightness_en;
     manager->spherical_plane_associations = &voxelmap_manager->ptpl_list_;
@@ -1253,11 +1271,12 @@ void LIVMapper::runSphericalVIO(const std::vector<cv::Mat> &images)
   {
     std::vector<SphericalInformationCandidate> pool;
     std::vector<std::pair<size_t, size_t>> observation_ids;
-    const size_t per_camera = std::max<size_t>(1, 360/camera_vios.size());
+    const size_t pool_limit = static_cast<size_t>(spherical_pool_size);
+    const size_t per_camera = std::max<size_t>(1, pool_limit/camera_vios.size());
     for (size_t index : order)
     {
       const auto &candidates = camera_vios[index]->spherical_candidates;
-      for (size_t j = 0; j < std::min(per_camera, candidates.size()) && pool.size() < 360; ++j)
+      for (size_t j = 0; j < std::min(per_camera, candidates.size()) && pool.size() < pool_limit; ++j)
       {
         pool.push_back({candidates[j].posterior_information, index,
                        reinterpret_cast<std::uintptr_t>(candidates[j].point.get()),
@@ -1266,7 +1285,8 @@ void LIVMapper::runSphericalVIO(const std::vector<cv::Mat> &images)
       }
     }
     last_incremental_pool_size = static_cast<int>(pool.size());
-    const auto selected = selectSphericalInformation(pool, total_patch_budget, max_active_cameras);
+    const auto selected = selectSphericalInformation(pool, total_patch_budget, max_active_cameras,
+                                                     static_cast<size_t>(spherical_min_patches_per_camera));
     std::vector<int> camera_quotas(camera_vios.size(), 0);
     for (size_t id : selected)
     {
@@ -1525,6 +1545,32 @@ void LIVMapper::runSphericalVIO(const std::vector<cv::Mat> &images)
       last_visual_guard_status = "final_cost_rejected";
       return;
     }
+    if (spherical_chi2_gate > 0.0 || spherical_max_correction_m > 0.0 || spherical_max_correction_deg > 0.0)
+    {
+      // Plausibility of the whole visual correction relative to the LIO prior.
+      // A lower photometric cost alone does not rule out a wrong basin.
+      const MD(DIM_STATE, 1) correction = _state - prior_state;
+      const Eigen::Matrix<double, 6, 1> pose_correction = correction.block<6, 1>(0, 0);
+      const MD(6, 6) pose_covariance = 0.5 * (prior_state.cov.block<6, 6>(0, 0) +
+                                              prior_state.cov.block<6, 6>(0, 0).transpose());
+      const Eigen::LDLT<MD(6, 6)> pose_factor(pose_covariance);
+      last_visual_correction_chi2 = pose_factor.info() == Eigen::Success
+                                      ? pose_correction.dot(pose_factor.solve(pose_correction)) : -1.0;
+      const bool chi2_fail = spherical_chi2_gate > 0.0 &&
+                             (!std::isfinite(last_visual_correction_chi2) || last_visual_correction_chi2 < 0.0 ||
+                              last_visual_correction_chi2 > spherical_chi2_gate);
+      const bool translation_fail = spherical_max_correction_m > 0.0 &&
+                                    pose_correction.block<3, 1>(3, 0).norm() > spherical_max_correction_m;
+      const bool rotation_fail = spherical_max_correction_deg > 0.0 &&
+                                 pose_correction.block<3, 1>(0, 0).norm() * 180.0 / M_PI > spherical_max_correction_deg;
+      if (chi2_fail || translation_fail || rotation_fail)
+      {
+        _state = prior_state;
+        ++last_visual_chi2_rejections;
+        last_visual_guard_status = "chi2_rejected";
+        return;
+      }
+    }
     if (spherical_transactional_update_en)
     {
       Eigen::LLT<MD(DIM_STATE, DIM_STATE)> factor(0.5 * (system + system.transpose()).eval());
@@ -1648,7 +1694,12 @@ void LIVMapper::enqueueMultiFisheyeImage(const cv::Mat &image, double timestamp,
       }
       group_time /= camera_count;
       // Downsample complete rig groups, not independent camera streams.
-      if (++camera_group_counter % (hilti_en ? 4 : camera_frame_stride) != 0) continue;
+      {
+        const int stride = hilti_en ? 4 : camera_frame_stride;
+        // frame_phase selects which group of each stride is kept; 0 is the
+        // original choice. Distinct phases give disjoint image subsets.
+        if ((++camera_group_counter + camera_frame_phase % stride) % stride != 0) continue;
+      }
       if (group_time <= last_timestamp_img + 0.02) continue;
       img_buffer.push_back(group.front());
       img_group_buffer.push_back(std::move(group));

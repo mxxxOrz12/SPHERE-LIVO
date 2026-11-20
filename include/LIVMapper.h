@@ -114,6 +114,21 @@ public:
   int spherical_probe_budget = 2048;
   int joint_max_iterations = 3;
   int spherical_map_max_points = 15000;
+  // Candidate shortlist per camera and global pool for incremental selection
+  // (previously fixed at 120 and 360), and a per-camera minimum (0 = none).
+  int spherical_shortlist_per_camera = 120;
+  int spherical_pool_size = 360;
+  int spherical_min_patches_per_camera = 0;
+  // Reject a committed visual correction whose Mahalanobis distance under the
+  // LIO prior (6-DoF pose block) exceeds this value, or whose translation or
+  // rotation exceeds the limits. Zero disables each check.
+  double spherical_chi2_gate = 0.0;
+  double spherical_max_correction_m = 0.0;
+  double spherical_max_correction_deg = 0.0;
+  int last_visual_chi2_rejections = 0;
+  double last_visual_correction_chi2 = -1.0;
+  // Which group of every frame_stride groups is kept (0 .. stride-1).
+  int camera_frame_phase = 0;
   int last_selected_spherical_patches = 0;
   int last_accepted_spherical_patches = 0;
   int last_refreshed_spherical_patches = 0;

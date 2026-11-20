@@ -23,8 +23,12 @@ struct SphericalInformationCandidate
 // Caller caps the shortlist independently of map size. This is greedy
 // complementary information, not an exact globally optimal subset search.
 // Select at most one camera observation per shared reference patch.
+// min_per_camera > 0 first grants each camera (up to camera_limit cameras,
+// in order of first appearance) that many picks by the same criterion
+// restricted to its own candidates; min_per_camera == 0 is the original rule.
 inline std::vector<size_t> selectSphericalInformation(
-    const std::vector<SphericalInformationCandidate> &candidates, size_t budget, size_t camera_limit)
+    const std::vector<SphericalInformationCandidate> &candidates, size_t budget, size_t camera_limit,
+    size_t min_per_camera = 0)
 {
   using Matrix6 = Eigen::Matrix<double, 6, 6>;
   std::vector<size_t> selected;
@@ -75,13 +79,15 @@ inline std::vector<size_t> selectSphericalInformation(
     trial.noalias() -= combined_cross*combined_information.ldlt().solve(combined_cross.transpose());
     return (.5*(trial+trial.transpose())).eval();
   };
-  while (selected.size() < budget)
+  // Returns false when no candidate (optionally of only_camera) adds information.
+  auto pick = [&](bool restrict_camera, size_t only_camera)
   {
     size_t best = candidates.size();
     double best_gain = 1e-12, best_logdet = 0;
     for (size_t i = 0; i < candidates.size(); ++i)
     {
       const auto &candidate = candidates[i];
+      if (restrict_camera && candidate.camera != only_camera) continue;
       if (!available[i] || patches.count(candidate.world_patch) ||
           (cameras.size() >= camera_limit && !cameras.count(candidate.camera))) continue;
       Eigen::LLT<Matrix6> factor(trial_information(i));
@@ -92,7 +98,7 @@ inline std::vector<size_t> selectSphericalInformation(
       if (std::isfinite(gain) && gain > best_gain)
       { best = i; best_gain = gain; best_logdet = logdet; }
     }
-    if (best == candidates.size()) break;
+    if (best == candidates.size()) return false;
     accumulated = trial_information(best);
     auto &camera_brightness = radiometry[candidates[best].camera];
     camera_brightness.cross += coupling[best];
@@ -102,6 +108,21 @@ inline std::vector<size_t> selectSphericalInformation(
     available[best] = false;
     cameras.insert(candidates[best].camera);
     patches.insert(candidates[best].world_patch);
+    return true;
+  };
+  if (min_per_camera > 0)
+  {
+    std::vector<size_t> order;
+    for (const auto &candidate : candidates)
+      if (std::find(order.begin(), order.end(), candidate.camera) == order.end()) order.push_back(candidate.camera);
+    for (size_t camera : order)
+    {
+      if (cameras.size() >= camera_limit && !cameras.count(camera)) continue;
+      for (size_t k = 0; k < min_per_camera && selected.size() < budget; ++k)
+        if (!pick(true, camera)) break;
+    }
   }
+  while (selected.size() < budget)
+    if (!pick(false, 0)) break;
   return selected;
 }

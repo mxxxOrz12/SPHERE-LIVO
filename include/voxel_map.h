@@ -50,6 +50,9 @@ typedef struct VoxelMapConfig
   double sliding_thresh;
   bool map_sliding_en;
   int half_map_size;
+  // Optional half size in meters. half_map_size is in voxels (FAST-LIVO2
+  // convention); values <= 0 keep that legacy behavior.
+  double half_map_size_m = -1.0;
 } VoxelMapConfig;
 
 typedef struct PointToPlane

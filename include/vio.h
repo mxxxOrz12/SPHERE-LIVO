@@ -198,6 +198,7 @@ public:
   int spherical_geometry_fine_rejections = 0;
   int spherical_geometry_coarse_rejections = 0;
   bool spherical_shared_brightness_en = false;
+  int spherical_shortlist_per_camera = 120; // Candidates kept per camera before global selection.
   bool spherical_local_brightness_en = false;
   bool spherical_bounded_brightness_en = false;
   int spherical_brightness_fit_rejections = 0, spherical_brightness_bound_fits = 0;

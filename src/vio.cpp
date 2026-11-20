@@ -533,7 +533,8 @@ void VIOManager::prepareSphericalFrame(const cv::Mat &image, const vector<pointW
   {
     // Bounded frame-level fit on the exact shortlist used by the global
     // selector. Populate joint pose/brightness information with this model.
-    const size_t count = std::min<size_t>(120,spherical_candidates.size());
+    const size_t count = std::min<size_t>(static_cast<size_t>(std::max(1, spherical_shortlist_per_camera)),
+                                          spherical_candidates.size());
     spherical_selected.assign(spherical_candidates.begin(),spherical_candidates.begin()+count);
     for (auto &observation : spherical_selected) observation.score = -1.0;
     spherical_cache_information = true;

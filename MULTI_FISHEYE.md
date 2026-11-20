@@ -62,6 +62,17 @@ with the legacy model, round trips and the Jacobian up to 105 degrees.
   update, with configurable active-camera and patch limits.
 - `spherical_map_max_points`, `spherical_probe_budget`, `total_patch_budget`:
   control map size, candidate probing and selected observations.
+- `spherical_shortlist_per_camera`, `spherical_pool_size`: candidates kept per
+  camera and in the global pool before incremental selection (default 120, 360).
+- `spherical_min_patches_per_camera`: per-camera minimum granted before the
+  global greedy selection (default 0).
+- `spherical_chi2_gate`, `spherical_max_correction_m`,
+  `spherical_max_correction_deg`: reject a visual correction that is implausible
+  under the LIO prior (default 0, disabled).
+- `multi_fisheye/frame_phase`: which group of every `frame_stride` groups is
+  used (default 0); different phases serve as seeds.
+- `local_map/half_map_size_m`: local LiDAR map half size in meters. The legacy
+  `half_map_size` counts voxels (FAST-LIVO2 convention).
 - Brightness, geometry-support and update-guard options are set explicitly in
   `config/sphere_oxford.yaml`; other combinations are experimental ablations.
 

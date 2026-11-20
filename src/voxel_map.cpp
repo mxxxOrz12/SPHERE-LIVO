@@ -50,6 +50,7 @@ void loadVoxelConfig(ros::NodeHandle &nh, VoxelMapConfig &voxel_config)
 
   nh.param<bool>("local_map/map_sliding_en", voxel_config.map_sliding_en, false);
   nh.param<int>("local_map/half_map_size", voxel_config.half_map_size, 100);
+  nh.param<double>("local_map/half_map_size_m", voxel_config.half_map_size_m, -1.0);
   nh.param<double>("local_map/sliding_thresh", voxel_config.sliding_thresh, 8);
 }
 
@@ -952,9 +953,13 @@ void VoxelMapManager::mapSliding()
     if (loc_xyz[j] < 0) { loc_xyz[j] -= 1.0; }
   }
   // VOXEL_LOCATION position((int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]);//discrete global
-  clearMemOutOfMap((int64_t)loc_xyz[0] + config_setting_.half_map_size, (int64_t)loc_xyz[0] - config_setting_.half_map_size,
-                    (int64_t)loc_xyz[1] + config_setting_.half_map_size, (int64_t)loc_xyz[1] - config_setting_.half_map_size,
-                    (int64_t)loc_xyz[2] + config_setting_.half_map_size, (int64_t)loc_xyz[2] - config_setting_.half_map_size);
+  // half_map_size counts voxels; half_map_size_m (if set) is converted to voxels.
+  const int half = config_setting_.half_map_size_m > 0.0
+                     ? static_cast<int>(std::ceil(config_setting_.half_map_size_m / config_setting_.max_voxel_size_))
+                     : config_setting_.half_map_size;
+  clearMemOutOfMap((int64_t)loc_xyz[0] + half, (int64_t)loc_xyz[0] - half,
+                    (int64_t)loc_xyz[1] + half, (int64_t)loc_xyz[1] - half,
+                    (int64_t)loc_xyz[2] + half, (int64_t)loc_xyz[2] - half);
   double t_sliding_end = omp_get_wtime();
   std::cout<<RED<<"[DEBUG]: Map sliding using "<<t_sliding_end - t_sliding_start<<" secs"<<RESET<<"\n";
   return;

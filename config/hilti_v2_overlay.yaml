@@ -1,0 +1,36 @@
+# SPHERE-LIVO v2 for Hilti 2022: overrides applied on top of the existing
+# Hilti preset used in phases 0-1 ("bounded_geometry_safe": cam0/cam3/cam4,
+# 3 active cameras, 4x4 patches, ZNCC 0.8, shared bounded brightness, ...).
+# Keys not listed here keep their preset values. See
+# docs/hilti_v2_comparison.md for how each profile is built.
+
+# --- Profile V1-map: preset + LiDAR local map aligned with Omni-LIVO --------
+local_map:
+  map_sliding_en: true
+  # Meters. Overrides half_map_size, which FAST-LIVO2 counts in voxels:
+  # half_map_size: 30 with 0.5 m voxels kept only +/-15 m, whereas Omni-LIVO
+  # reads its half_map_size: 30 as meters.
+  half_map_size_m: 30.0
+
+# --- Profile V2: V1-map plus the settings below ----------------------------
+innovations:
+  total_patch_budget: 300               # Omni-LIVO uses max_total_points: 300
+  max_active_cameras: 3
+  spherical_shortlist_per_camera: 200   # was fixed at 120
+  spherical_pool_size: 600              # was fixed at 360
+  spherical_min_patches_per_camera: 50  # Omni-LIVO keeps at least 50 per camera
+  spherical_pyramid_levels: 3           # Omni-LIVO uses 4 pyramid levels
+  joint_max_iterations: 5               # Omni-LIVO uses 5 iterations
+  spherical_chi2_gate: 22.46            # 6-DoF chi-square, 99.9 %
+  spherical_max_correction_m: 0.2
+  spherical_max_correction_deg: 2.0
+
+# Unchanged in V2 (listed for clarity):
+# vio:
+#   img_point_cov: 1000
+#   patch_size: 4
+
+# Seeds: choose which of every 4 synchronized groups is used (0..3). Phase 0
+# is the previous behaviour. Apply the same phase to Omni-LIVO's input.
+# multi_fisheye:
+#   frame_phase: 0
